@@ -13,8 +13,8 @@ set -euo pipefail
 # libero_spatial | libero_object | libero_goal | libero_10
 TASK_SUITES="${TASK_SUITES:-libero_spatial}"
 
-PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/umd-datapool/kaixi/PAIR/checkpoints/l20_PAIR_v5_0.1w_fixed0.5_specialize_spatial}"
-GPU="${GPU:-7}"
+PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/umd-datapool/kaixi/PAIR/checkpoints/l20_PAIR_v8_learnable0_specialize_spatial_acc--50000_chkpt}"
+GPU="${GPU:-3}"
 NUM_TRIALS_PER_TASK="${NUM_TRIALS_PER_TASK:-50}"
 SEED="${SEED:-7}"
 NUM_STEPS_WAIT="${NUM_STEPS_WAIT:-10}"

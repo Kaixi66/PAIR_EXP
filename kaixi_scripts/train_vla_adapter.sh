@@ -120,7 +120,9 @@ export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
 
-torchrun_bin="${TORCHRUN_BIN:-torchrun}"
+python_bin="${PYTHON_BIN:-/data/miniconda3/envs/${CONDA_ENV}/bin/python}"
+torchrun_bin="${TORCHRUN_BIN:-/data/miniconda3/envs/${CONDA_ENV}/bin/torchrun}"
+hash -r
 
 cmd=(
     "${torchrun_bin}"
@@ -171,6 +173,8 @@ cat <<EOF
 [train_vla_adapter] gpus: ${CUDA_VISIBLE_DEVICES}
 [train_vla_adapter] nproc_per_node: ${NPROC_PER_NODE}
 [train_vla_adapter] effective_batch: $((NPROC_PER_NODE * BATCH_SIZE * GRAD_ACCUMULATION_STEPS))
+[train_vla_adapter] python: ${python_bin}
+[train_vla_adapter] torchrun: ${torchrun_bin}
 [train_vla_adapter] wandb: ${WANDB_ENTITY}/${WANDB_PROJECT}
 [train_vla_adapter] exp_name: ${EXP_NAME}
 [train_vla_adapter] wandb_run_name: ${EXP_NAME}

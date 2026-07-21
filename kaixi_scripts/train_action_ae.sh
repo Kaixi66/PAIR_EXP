@@ -11,8 +11,8 @@ set -euo pipefail
 #########################
 
 AE_VERSION="${AE_VERSION:-v2}"  # v1/action_only or v2/conditioned
-DATASET_NAME="${DATASET_NAME:-libero_spatial_no_noops}" # libero_4_task_suites_no_noops
-GPUS="${GPUS:-0,1,2,3}"
+DATASET_NAME="${DATASET_NAME:-libero_10_no_noops}" # libero_4_task_suites_no_noops
+GPUS="${GPUS:-4,5,6,7}"
 
 BATCH_SIZE="${BATCH_SIZE:-8}"
 MAX_STEPS="${MAX_STEPS:-50000}"
@@ -36,7 +36,7 @@ NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
 WANDB_ENTITY="${WANDB_ENTITY:-kaixi-university-of-maryland}"
 WANDB_PROJECT="${WANDB_PROJECT:-PAIR}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-EXP_NAME="${EXP_NAME:-conditionedAE_en2_de1_spatial}"
+EXP_NAME="${EXP_NAME:-conditionedAE_en2_de1_10}"
 
 DRY_RUN="${DRY_RUN:-false}"
 BACKGROUND="${BACKGROUND:-false}"

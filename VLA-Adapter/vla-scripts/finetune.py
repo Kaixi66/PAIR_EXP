@@ -6,6 +6,7 @@ Fine-tunes Qwen2.5-0.5B via LoRA.
 
 import os
 import json
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -22,7 +23,6 @@ from huggingface_hub import HfApi, snapshot_download
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import MultiStepLR, CosineAnnealingLR
 from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -108,8 +108,9 @@ class FinetuneConfig:
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
     learning_rate: float = 5e-4                      # Learning rate
-    weight_decay: float = 1e-4                       # AdamW weight decay for non-bias/non-norm/non-gate parameters
-    lr_warmup_steps: int = 0.1                       # Number of steps to warm up learning rate (from 10% to 100%)
+    lr_scheduler: str = "multistep"                  # LR schedule: constant, multistep, or cosine
+    lr_warmup_steps: int = 0                         # Exact number of optimizer steps to warm up; overrides ratio
+    lr_warmup_ratio: float = 0.0                     # Fraction of max_steps used for warmup when steps is 0
     num_steps_before_decay: int = 100000             # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
     max_steps: int = 200000                          # Max number of training steps
@@ -152,6 +153,7 @@ class FinetuneConfig:
     pair_align_weight: float = 0.05
     pair_bridge_dim: int = 512
     pair_gate_mlp_dim: int = 256
+    pair_gate_num_layers: int = 1
     pair_init_gate_mode: str = "learnable"
     pair_init_gate_value: float = 0.05
     pair_init_gate_granularity: str = "per_step"
@@ -186,40 +188,44 @@ def remove_ddp_in_checkpoint(state_dict) -> dict:
     return new_state_dict
 
 
-NO_WEIGHT_DECAY_KEYWORDS = ("bias", "norm", "gate")
+def resolve_lr_warmup_steps(cfg: FinetuneConfig) -> int:
+    if cfg.lr_warmup_steps < 0:
+        raise ValueError(f"lr_warmup_steps must be >= 0, got {cfg.lr_warmup_steps}")
+    if cfg.lr_warmup_ratio < 0.0 or cfg.lr_warmup_ratio >= 1.0:
+        raise ValueError(f"lr_warmup_ratio must be in [0, 1), got {cfg.lr_warmup_ratio}")
+    if cfg.lr_warmup_steps > 0:
+        return int(cfg.lr_warmup_steps)
+    return int(cfg.max_steps * cfg.lr_warmup_ratio)
 
 
-def use_weight_decay_for_param(param_name: str) -> bool:
-    lower_name = param_name.lower()
-    return not any(keyword in lower_name for keyword in NO_WEIGHT_DECAY_KEYWORDS)
+def compute_lr_scale(cfg: FinetuneConfig, step: int, warmup_steps: int) -> float:
+    scheduler = cfg.lr_scheduler.lower()
+    if scheduler in {"none", "off"}:
+        scheduler = "constant"
+
+    if warmup_steps > 0 and step < warmup_steps:
+        progress = min(float(step + 1) / float(warmup_steps), 1.0)
+        return 0.1 + 0.9 * progress
+
+    if scheduler == "constant":
+        return 1.0
+    if scheduler in {"multistep", "step"}:
+        return 0.1 if step >= cfg.num_steps_before_decay else 1.0
+    if scheduler in {"cosine", "cosine_annealing", "cosineannealing"}:
+        decay_steps = max(1, cfg.max_steps - warmup_steps)
+        decay_progress = min(max(step - warmup_steps, 0) / decay_steps, 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+
+    raise ValueError(
+        f"Unsupported lr_scheduler={cfg.lr_scheduler!r}; expected constant, multistep, or cosine."
+    )
 
 
-def add_optimizer_param_groups(
-    param_groups: list,
-    module: nn.Module,
-    module_name: str,
-    learning_rate: float,
-    weight_decay: float,
-) -> Tuple[int, int]:
-    decay_params = []
-    no_decay_params = []
-
-    for name, param in module.named_parameters():
-        if not param.requires_grad:
-            continue
-
-        full_name = f"{module_name}.{name}"
-        if use_weight_decay_for_param(full_name):
-            decay_params.append(param)
-        else:
-            no_decay_params.append(param)
-
-    if decay_params:
-        param_groups.append({"params": decay_params, "lr": learning_rate, "weight_decay": weight_decay})
-    if no_decay_params:
-        param_groups.append({"params": no_decay_params, "lr": learning_rate, "weight_decay": 0.0})
-
-    return sum(p.numel() for p in decay_params), sum(p.numel() for p in no_decay_params)
+def set_optimizer_lr(optimizer: torch.optim.Optimizer, base_lr: float, lr_scale: float) -> float:
+    current_lr = base_lr * lr_scale
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = current_lr
+    return current_lr
 
 
 
@@ -1158,6 +1164,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             horizon=NUM_ACTIONS_CHUNK,
             action_dim=ACTION_DIM,
             gate_mlp_dim=cfg.pair_gate_mlp_dim,
+            gate_num_layers=cfg.pair_gate_num_layers,
             init_gate_mode=cfg.pair_init_gate_mode,
             init_gate_value=cfg.pair_init_gate_value,
             init_gate_granularity=cfg.pair_init_gate_granularity,
@@ -1180,62 +1187,29 @@ def finetune(cfg: FinetuneConfig) -> None:
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
 
-    # Instantiate optimizer. Keep bias, normalization, and PAIR gate parameters out of AdamW decay.
-    optimizer_param_groups = []
-    decay_param_count = 0
-    no_decay_param_count = 0
-
-    decay_count, no_decay_count = add_optimizer_param_groups(
-        optimizer_param_groups, vla, "vla", cfg.learning_rate, cfg.weight_decay
-    )
-    decay_param_count += decay_count
-    no_decay_param_count += no_decay_count
-
+    # Instantiate optimizer using the original VLA-Adapter style.
+    trainable_params = [param for param in vla.parameters() if param.requires_grad]
     if cfg.use_l1_regression:
-        decay_count, no_decay_count = add_optimizer_param_groups(
-            optimizer_param_groups, action_head, "action_head", cfg.learning_rate, cfg.weight_decay
-        )
-        decay_param_count += decay_count
-        no_decay_param_count += no_decay_count
-
+        trainable_params += [param for param in action_head.parameters() if param.requires_grad]
     if cfg.use_proprio:
-        decay_count, no_decay_count = add_optimizer_param_groups(
-            optimizer_param_groups, proprio_projector, "proprio_projector", cfg.learning_rate, cfg.weight_decay
-        )
-        decay_param_count += decay_count
-        no_decay_param_count += no_decay_count
-
+        trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
     if cfg.use_pair_bridge:
-        decay_count, no_decay_count = add_optimizer_param_groups(
-            optimizer_param_groups, pair_bridge, "pair_bridge", cfg.learning_rate, cfg.weight_decay
-        )
-        decay_param_count += decay_count
-        no_decay_param_count += no_decay_count
+        trainable_params += [param for param in pair_bridge.parameters() if param.requires_grad]
 
     if distributed_state.is_main_process:
-        print(f"# total trainable params: {decay_param_count + no_decay_param_count}")
-        print(
-            f"# weight-decay params: {decay_param_count}; "
-            f"no-decay params: {no_decay_param_count}; weight_decay={cfg.weight_decay}"
-        )
-    optimizer = AdamW(optimizer_param_groups, lr=cfg.learning_rate)
+        print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
 
-    # Create learning rate scheduler
-    # 1. MultiStepLR
-    scheduler = MultiStepLR(
-        optimizer,
-        milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
-        gamma=0.1,  # Multiplicative factor of learning rate decay
-    )
-    # 2. CosineAnnealingLR
-    # scheduler = CosineAnnealingLR(
-    #         optimizer,
-    #         T_max=cfg.num_steps_before_decay, 
-    #         eta_min=0.0001,          
-    #         )
+    warmup_steps = resolve_lr_warmup_steps(cfg)
+    if distributed_state.is_main_process:
+        print(
+            f"LR schedule: scheduler={cfg.lr_scheduler}, base_lr={original_lr}, "
+            f"warmup_steps={warmup_steps}, warmup_ratio={cfg.lr_warmup_ratio}, "
+            f"num_steps_before_decay={cfg.num_steps_before_decay}"
+        )
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1356,6 +1330,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             # Compute gradient step index before forward so PAIR loss schedules can use it.
             gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
             log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            current_lr = set_optimizer_lr(
+                optimizer,
+                original_lr,
+                compute_lr_scale(cfg, log_step, warmup_steps),
+            )
 
             # Compute training metrics and loss
             compute_diffusion_l1 = distributed_state.is_main_process and (
@@ -1399,27 +1378,19 @@ def finetune(cfg: FinetuneConfig) -> None:
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
-            # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
-                lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
-                current_lr = original_lr * (0.1 + 0.9 * lr_progress)
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
-
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log the learning rate
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
                 wandb.log(
                     {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
+                        "VLA Train/Learning Rate": current_lr,
                     },
                     step=log_step,
                 )
 
-            # Optimizer and LR scheduler step
+            # Optimizer step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
-                scheduler.step()
                 optimizer.zero_grad()
                 progress.update()
 

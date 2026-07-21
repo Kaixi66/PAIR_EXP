@@ -34,14 +34,14 @@ def test_pair_bridge_shapes_and_gate_init(tmp_path: Path):
     assert dict(bridge.named_parameters())["align_proj.3.weight"].shape == (16, 512)
     assert dict(bridge.named_parameters())["init_proj.1.weight"].shape == (2048, 512)
     assert dict(bridge.named_parameters())["init_proj.3.weight"].shape == (4096, 2048)
-    assert dict(bridge.named_parameters())["gate_proj.0.weight"].shape == (256, 512)
-    assert dict(bridge.named_parameters())["gate_proj.2.weight"].shape == (1, 256)
+    assert dict(bridge.named_parameters())["gate_proj.weight"].shape == (1, 512)
     assert "slot_scale" not in dict(bridge.named_parameters())
-    assert torch.count_nonzero(bridge.gate_proj[2].weight) == 0
+    assert torch.count_nonzero(bridge.gate_proj.weight) == 0
     expected_bias = torch.logit(torch.tensor(config.init_gate_value))
-    assert torch.allclose(bridge.gate_proj[2].bias, expected_bias.reshape(1))
+    assert torch.allclose(bridge.gate_proj.bias, expected_bias.reshape(1))
     assert bridge.config.bridge_mlp_dim == 2048
     assert bridge.config.init_mlp_dim == 2048
+    assert bridge.config.gate_num_layers == 1
     assert bridge.config.gate_mlp_dim == 256
     assert bridge.cross_block.cross_attn.embed_dim == 512
     assert bridge.self_block.self_attn.embed_dim == 512
@@ -63,6 +63,24 @@ def test_pair_bridge_shapes_and_gate_init(tmp_path: Path):
     assert loaded_output.action_init_delta.shape == (2, 8, 4096)
     assert loaded_output.z_align.shape == (2, 8, 16)
     assert loaded_output.init_gate.shape == (2, 8)
+
+
+def test_pair_bridge_two_layer_gate_config():
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+        gate_num_layers=2,
+        gate_mlp_dim=16,
+    )
+    bridge = PairBridge(config)
+
+    assert dict(bridge.named_parameters())["gate_proj.0.weight"].shape == (16, 32)
+    assert dict(bridge.named_parameters())["gate_proj.2.weight"].shape == (1, 16)
+    assert torch.count_nonzero(bridge.gate_proj[2].weight) == 0
 
 
 def test_pair_perception_helper_training_and_inference_masks():
@@ -178,10 +196,8 @@ def test_pair_bridge_keeps_gate_fp32_after_bf16_cast():
     assert bridge.cross_block.cross_attn.in_proj_weight.dtype == torch.bfloat16
     assert bridge.self_block.self_attn.in_proj_weight.dtype == torch.bfloat16
     assert bridge.gate_norm.weight.dtype == torch.float32
-    assert bridge.gate_proj[0].weight.dtype == torch.float32
-    assert bridge.gate_proj[2].weight.dtype == torch.float32
-    assert dict(bridge.named_parameters())["gate_proj.0.weight"].dtype == torch.float32
-    assert dict(bridge.named_parameters())["gate_proj.2.weight"].dtype == torch.float32
+    assert bridge.gate_proj.weight.dtype == torch.float32
+    assert dict(bridge.named_parameters())["gate_proj.weight"].dtype == torch.float32
 
 
 def test_pair_bridge_bf16_forward_with_fp32_gate_on_cuda():
@@ -231,8 +247,8 @@ def test_pair_bridge_input_dependent_gate_changes_with_tokens():
     config = PairBridgeConfig(llm_dim=64, bridge_dim=32, latent_dim=8, horizon=8, action_dim=7, num_heads=4)
     bridge = PairBridge(config)
     with torch.no_grad():
-        bridge.gate_proj[2].weight[:, 0] = 0.25
-        bridge.gate_proj[2].bias.zero_()
+        bridge.gate_proj.weight[:, 0] = 0.25
+        bridge.gate_proj.bias.zero_()
     perception_tokens = torch.randn(2, 6, 64)
     base_init = torch.zeros(2, 8, 64)
 

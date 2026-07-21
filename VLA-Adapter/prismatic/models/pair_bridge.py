@@ -27,6 +27,7 @@ class PairBridgeConfig:
     bridge_mlp_dim: Optional[int] = None
     init_mlp_dim: Optional[int] = None
     gate_mlp_dim: int = 256
+    gate_num_layers: int = 1
     init_gate_mode: str = "learnable"
     init_gate_value: float = 0.05
     init_gate_granularity: str = "per_step"
@@ -35,6 +36,8 @@ class PairBridgeConfig:
     init_gate_value_is_actual: bool = True
 
     def __post_init__(self) -> None:
+        if self.gate_num_layers < 1:
+            raise ValueError(f"gate_num_layers must be >= 1, got {self.gate_num_layers}")
         if self.bridge_mlp_dim is None:
             object.__setattr__(self, "bridge_mlp_dim", 4 * self.bridge_dim)
         if self.init_mlp_dim is None:
@@ -221,11 +224,7 @@ class PairBridge(nn.Module):
         )
         if self.uses_input_dependent_gate:
             self.gate_norm = nn.LayerNorm(self.config.bridge_dim)
-            self.gate_proj = nn.Sequential(
-                nn.Linear(self.config.bridge_dim, self.config.gate_mlp_dim, bias=True),
-                nn.GELU(),
-                nn.Linear(self.config.gate_mlp_dim, 1, bias=True),
-            )
+            self.gate_proj = self._build_gate_projection()
         else:
             self.gate_norm = None
             self.gate_proj = None
@@ -278,12 +277,38 @@ class PairBridge(nn.Module):
             f"Unsupported gate_activation={self.config.gate_activation!r}; expected 'sigmoid' or 'tanh'."
         )
 
+    def _build_gate_projection(self) -> nn.Module:
+        if self.config.gate_num_layers == 1:
+            return nn.Linear(self.config.bridge_dim, 1, bias=True)
+
+        layers: list[nn.Module] = [
+            nn.Linear(self.config.bridge_dim, self.config.gate_mlp_dim, bias=True),
+            nn.GELU(),
+        ]
+        for _ in range(self.config.gate_num_layers - 2):
+            layers.extend(
+                [
+                    nn.Linear(self.config.gate_mlp_dim, self.config.gate_mlp_dim, bias=True),
+                    nn.GELU(),
+                ]
+            )
+        layers.append(nn.Linear(self.config.gate_mlp_dim, 1, bias=True))
+        return nn.Sequential(*layers)
+
+    def _gate_output_layer(self) -> nn.Linear:
+        if isinstance(self.gate_proj, nn.Linear):
+            return self.gate_proj
+        if isinstance(self.gate_proj, nn.Sequential) and isinstance(self.gate_proj[-1], nn.Linear):
+            return self.gate_proj[-1]
+        raise TypeError("Input-dependent gate projection must end with an nn.Linear layer.")
+
     def reset_parameters(self) -> None:
         nn.init.normal_(self.bridge_queries, mean=0.0, std=0.02)
         nn.init.normal_(self.bridge_pos_embed, mean=0.0, std=0.02)
         if self.uses_input_dependent_gate:
-            nn.init.zeros_(self.gate_proj[-1].weight)
-            nn.init.constant_(self.gate_proj[-1].bias, self._initial_gate_raw_value())
+            output_layer = self._gate_output_layer()
+            nn.init.zeros_(output_layer.weight)
+            nn.init.constant_(output_layer.bias, self._initial_gate_raw_value())
 
     def keep_high_precision_params(self) -> None:
         """Keep small gate parameters in fp32 after bulk bf16 conversion."""
@@ -400,11 +425,36 @@ def save_pair_bridge_checkpoint(
     )
 
 
+def _infer_gate_num_layers_from_state_dict(state_dict: Dict[str, Tensor]) -> Optional[int]:
+    if "gate_proj.weight" in state_dict:
+        return 1
+
+    linear_layer_indices = []
+    prefix = "gate_proj."
+    suffix = ".weight"
+    for key in state_dict:
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        maybe_index = key[len(prefix) : -len(suffix)]
+        if maybe_index.isdigit():
+            linear_layer_indices.append(int(maybe_index))
+
+    if linear_layer_indices:
+        return len(set(linear_layer_indices))
+    return None
+
+
 def load_pair_bridge_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> PairBridge:
     payload = torch.load(path, map_location=map_location)
-    config = PairBridgeConfig.from_dict(payload["model_config"])
+    model_config = dict(payload["model_config"])
+    state_dict = payload["state_dict"]
+    if "gate_num_layers" not in model_config:
+        inferred_gate_layers = _infer_gate_num_layers_from_state_dict(state_dict)
+        if inferred_gate_layers is not None:
+            model_config["gate_num_layers"] = inferred_gate_layers
+    config = PairBridgeConfig.from_dict(model_config)
     model = PairBridge(config)
-    model.load_state_dict(payload["state_dict"])
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
