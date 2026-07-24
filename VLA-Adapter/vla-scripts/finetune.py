@@ -64,16 +64,16 @@ try:
     from prismatic.models.pair_bridge import (
         PairBridge,
         PairBridgeConfig,
+        alignment_loss,
         build_pair_perception_tokens,
-        cosine_alignment_loss,
         load_frozen_action_encoder,
         save_pair_bridge_checkpoint,
     )
 except ImportError:
     PairBridge = None
     PairBridgeConfig = None
+    alignment_loss = None
     build_pair_perception_tokens = None
-    cosine_alignment_loss = None
     load_frozen_action_encoder = None
     save_pair_bridge_checkpoint = None
 
@@ -151,6 +151,7 @@ class FinetuneConfig:
     use_pair_bridge: bool = False
     pair_action_ae_encoder_path: str = "/umd-datapool/kaixi/PAIR/action_ae_runs/ae_libero_1/encoder.pt"
     pair_align_weight: float = 0.05
+    pair_align_loss_type: str = "cosine"
     pair_bridge_dim: int = 512
     pair_gate_mlp_dim: int = 256
     pair_gate_num_layers: int = 1
@@ -543,7 +544,11 @@ def run_forward_pass(
                 else:
                     action_latents = action_ae_encoder(ground_truth_actions.float()).detach()
 
-            pair_align_loss = cosine_alignment_loss(pair_output.z_align, action_latents)
+            pair_align_loss = alignment_loss(
+                pair_output.z_align,
+                action_latents,
+                loss_type=cfg.pair_align_loss_type,
+            )
             pair_lambda = float(cfg.pair_align_weight)
             pair_init_gate = pair_output.init_gate.detach().float()
             pair_init_gate_raw = pair_output.init_gate_raw.detach().float()
@@ -702,6 +707,8 @@ def save_eval_model_config(cfg: FinetuneConfig, checkpoint_dir: Path) -> None:
             "use_lora": cfg.use_lora,
             "use_fz": cfg.use_fz,
             "lora_rank": cfg.lora_rank,
+            "pair_align_loss_type": cfg.pair_align_loss_type,
+            "pair_align_weight": cfg.pair_align_weight,
         },
     }
     with open(checkpoint_dir / "vla_adapter_eval_config.json", "w") as f:
@@ -792,7 +799,12 @@ def save_training_checkpoint(
                 pair_bridge=pair_bridge,
                 config=pair_config,
                 action_ae_encoder_path=cfg.pair_action_ae_encoder_path,
-                metadata={"step": log_step, "run_id": checkpoint_dir.name},
+                metadata={
+                    "step": log_step,
+                    "run_id": checkpoint_dir.name,
+                    "align_loss_type": cfg.pair_align_loss_type,
+                    "align_weight": cfg.pair_align_weight,
+                },
             )
 
         if cfg.use_film:
@@ -944,6 +956,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    cfg.pair_align_loss_type = str(cfg.pair_align_loss_type).strip().lower()
+    if cfg.pair_align_loss_type not in {"cosine", "l2"}:
+        raise ValueError(
+            f"Unsupported pair_align_loss_type={cfg.pair_align_loss_type!r}; expected 'cosine' or 'l2'."
+        )
 
     # GPU setup
     distributed_state = PartialState()
