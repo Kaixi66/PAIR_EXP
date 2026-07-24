@@ -5,7 +5,9 @@ import torch
 from prismatic.models.pair_bridge import (
     PairBridge,
     PairBridgeConfig,
+    alignment_loss,
     build_pair_perception_tokens,
+    cosine_alignment_loss,
     load_pair_bridge_checkpoint,
     save_pair_bridge_checkpoint,
 )
@@ -280,3 +282,37 @@ def test_pair_bridge_respects_configured_latent_dim():
     output = bridge(perception_tokens, base_init)
 
     assert output.z_align.shape == (2, 8, 8)
+
+
+def test_pair_alignment_loss_supports_cosine_and_l2():
+    predicted = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], requires_grad=True)
+    target = torch.tensor([[[0.0, 0.0], [1.0, 2.0]]])
+
+    cosine = alignment_loss(predicted, target, loss_type="cosine")
+    l2 = alignment_loss(predicted, target, loss_type="l2")
+
+    assert torch.allclose(cosine, cosine_alignment_loss(predicted, target))
+    assert torch.allclose(l2, torch.tensor(3.25))
+
+    l2.backward()
+    assert predicted.grad is not None
+    assert predicted.grad.abs().sum() > 0
+
+
+def test_pair_alignment_loss_rejects_invalid_type_and_shape():
+    predicted = torch.zeros(1, 8, 16)
+    target = torch.zeros(1, 8, 16)
+
+    try:
+        alignment_loss(predicted, target, loss_type="l1")
+    except ValueError as exc:
+        assert "expected 'cosine' or 'l2'" in str(exc)
+    else:
+        raise AssertionError("Expected invalid alignment loss type to raise ValueError")
+
+    try:
+        alignment_loss(predicted, target[:, :, :8], loss_type="l2")
+    except ValueError as exc:
+        assert "must have same shape" in str(exc)
+    else:
+        raise AssertionError("Expected mismatched alignment tensor shapes to raise ValueError")

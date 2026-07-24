@@ -391,11 +391,23 @@ class PairBridge(nn.Module):
         )
 
 
-def cosine_alignment_loss(predicted: Tensor, target: Tensor) -> Tensor:
+def alignment_loss(predicted: Tensor, target: Tensor, loss_type: str = "cosine") -> Tensor:
     if predicted.shape != target.shape:
         raise ValueError(f"Alignment tensors must have same shape, got {predicted.shape} and {target.shape}")
-    cosine = F.cosine_similarity(predicted.float(), target.float(), dim=-1)
-    return (1.0 - cosine).mean()
+    loss_type = str(loss_type).strip().lower()
+    predicted_float = predicted.float()
+    target_float = target.float()
+    if loss_type == "cosine":
+        cosine = F.cosine_similarity(predicted_float, target_float, dim=-1)
+        return (1.0 - cosine).mean()
+    if loss_type == "l2":
+        return F.mse_loss(predicted_float, target_float)
+    raise ValueError(f"Unsupported alignment loss type: {loss_type!r}; expected 'cosine' or 'l2'.")
+
+
+def cosine_alignment_loss(predicted: Tensor, target: Tensor) -> Tensor:
+    """Backward-compatible wrapper for the original PAIR alignment objective."""
+    return alignment_loss(predicted, target, loss_type="cosine")
 
 
 def _unwrap(module: nn.Module) -> nn.Module:
