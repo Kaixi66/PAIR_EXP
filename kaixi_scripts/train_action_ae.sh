@@ -3,7 +3,7 @@ set -euo pipefail
 
 # PAIR Action AE training launcher. Override values at launch, for example:
 #   MAX_STEPS=2 BATCH_SIZE=4 WANDB_MODE=disabled ./train_action_ae.sh
-#   AE_VERSION=conditioned LATENT_DIM=16 MASK_PROB=0.5 ./train_action_ae.sh
+#   AE_VERSION=conditioned LATENT_DIM=16 MASK_MODE=chunk MASK_COUNT=4 ./train_action_ae.sh
 #   DATASET_NAME=libero_spatial_no_noops GPUS=0,1 BATCH_SIZE=16 ./train_action_ae.sh
 
 #########################
@@ -28,8 +28,10 @@ ENCODER_LAYERS="${ENCODER_LAYERS:-1}"
 PERCEPTION_LAYERS="${PERCEPTION_LAYERS:-1}"
 DECODER_LAYERS="${DECODER_LAYERS:-1}"
 
-# Corruption settings. MASK_PROB is the probability of masking one action step in the 8-step chunk.
+# Corruption settings. random uses MASK_PROB; chunk masks exactly MASK_COUNT consecutive steps.
+MASK_MODE="${MASK_MODE:-random}"
 MASK_PROB="${MASK_PROB:-0.5}"
+MASK_COUNT="${MASK_COUNT:-4}"
 NOISE_STD="${NOISE_STD:-0.05}"
 NUM_IMAGES_IN_INPUT="${NUM_IMAGES_IN_INPUT:-2}"
 
@@ -156,7 +158,9 @@ if [[ "${AE_VERSION}" == "v2" ]]; then
         --encoder_layers "${ENCODER_LAYERS}"
         --perception_layers "${PERCEPTION_LAYERS}"
         --decoder_layers "${DECODER_LAYERS}"
+        --mask_mode "${MASK_MODE}"
         --mask_prob "${MASK_PROB}"
+        --mask_count "${MASK_COUNT}"
         --noise_std "${NOISE_STD}"
     )
 fi
@@ -211,7 +215,9 @@ if [[ "${AE_VERSION}" == "v2" ]]; then
 [train_action_ae] encoder_layers: ${ENCODER_LAYERS}
 [train_action_ae] perception_layers: ${PERCEPTION_LAYERS}
 [train_action_ae] decoder_layers: ${DECODER_LAYERS}
+[train_action_ae] mask_mode: ${MASK_MODE}
 [train_action_ae] mask_prob: ${MASK_PROB}
+[train_action_ae] mask_count: ${MASK_COUNT}
 [train_action_ae] noise_std: ${NOISE_STD}
 EOF
 fi
