@@ -52,7 +52,9 @@ class ActionPerceptionAEConfig:
     dropout: float = 0.0
     activation: str = "gelu"
     norm_first: bool = True
+    mask_mode: str = "random"
     mask_prob: float = 0.3
+    mask_count: int = 4
     noise_std: float = 0.05
 
     def to_dict(self) -> Dict[str, object]:
@@ -198,16 +200,38 @@ def corrupt_actions(
     *,
     mask_prob: float,
     noise_std: float,
+    mask_mode: str = "random",
+    mask_count: int = 4,
     training: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     if actions.ndim != 3:
         raise ValueError(f"Expected actions with shape [B, H, A], got {tuple(actions.shape)}")
+    if mask_mode not in {"random", "chunk"}:
+        raise ValueError(f"Unsupported mask_mode={mask_mode!r}; expected 'random' or 'chunk'")
+    if mask_mode == "chunk":
+        if not isinstance(mask_count, int):
+            raise ValueError(f"mask_count must be an integer, got {type(mask_count).__name__}")
+        horizon = actions.shape[1]
+        if not 0 <= mask_count <= horizon:
+            raise ValueError(f"mask_count must be between 0 and horizon ({horizon}), got {mask_count}")
+
     mask = torch.zeros(actions.shape[:2], dtype=torch.bool, device=actions.device)
     corrupted = actions
     if training and noise_std > 0:
         corrupted = corrupted + torch.randn_like(corrupted) * noise_std
-    if training and mask_prob > 0:
+    if training and mask_mode == "random" and mask_prob > 0:
         mask = torch.rand(actions.shape[:2], device=actions.device) < mask_prob
+        corrupted = corrupted.masked_fill(mask.unsqueeze(-1), 0.0)
+    elif training and mask_mode == "chunk" and mask_count > 0:
+        batch_size, horizon = actions.shape[:2]
+        starts = torch.randint(
+            low=0,
+            high=horizon - mask_count + 1,
+            size=(batch_size,),
+            device=actions.device,
+        )
+        positions = torch.arange(horizon, device=actions.device).unsqueeze(0)
+        mask = (positions >= starts.unsqueeze(1)) & (positions < (starts + mask_count).unsqueeze(1))
         corrupted = corrupted.masked_fill(mask.unsqueeze(-1), 0.0)
     return corrupted, mask
 
@@ -373,6 +397,8 @@ class ActionPerceptionTransformerAE(nn.Module):
             actions.float(),
             mask_prob=self.config.mask_prob,
             noise_std=self.config.noise_std,
+            mask_mode=self.config.mask_mode,
+            mask_count=self.config.mask_count,
             training=corrupt and self.training,
         )
         latents = self.encode(corrupted_actions, perception_tokens, perception_mask)

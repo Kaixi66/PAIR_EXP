@@ -82,7 +82,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vlm_path", type=str, default=None)
     parser.add_argument("--vla_config_file_path", type=str, default=None)
     parser.add_argument("--num_images_in_input", type=int, default=None)
+    parser.add_argument("--mask_mode", choices=("random", "chunk"), default=None)
     parser.add_argument("--mask_prob", type=float, default=None)
+    parser.add_argument("--mask_count", type=int, default=None)
     parser.add_argument("--noise_std", type=float, default=None)
     return parser.parse_args()
 
@@ -157,8 +159,12 @@ def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dic
         updates.setdefault("vla", {})["config_file_path"] = args.vla_config_file_path
     if args.num_images_in_input is not None:
         updates.setdefault("vla", {})["num_images_in_input"] = args.num_images_in_input
+    if args.mask_mode is not None:
+        updates.setdefault("model", {})["mask_mode"] = args.mask_mode
     if args.mask_prob is not None:
         updates.setdefault("model", {})["mask_prob"] = args.mask_prob
+    if args.mask_count is not None:
+        updates.setdefault("model", {})["mask_count"] = args.mask_count
     if args.noise_std is not None:
         updates.setdefault("model", {})["noise_std"] = args.noise_std
     return deep_update(config, updates)
@@ -536,6 +542,8 @@ def evaluate_v2(
             actions,
             mask_prob=model.config.mask_prob,
             noise_std=model.config.noise_std,
+            mask_mode=model.config.mask_mode,
+            mask_count=model.config.mask_count,
             training=True,
         )
         latents = model.encode(corrupted, perception_tokens, perception_mask)
@@ -591,7 +599,9 @@ def train_v2(
     perception_dim = int(getattr(vla, "llm_dim", getattr(text_config, "hidden_size", 896)))
     model_cfg["perception_dim"] = perception_dim
     model_cfg.setdefault("latent_dim", 16)
+    model_cfg.setdefault("mask_mode", "random")
     model_cfg.setdefault("mask_prob", 0.3)
+    model_cfg.setdefault("mask_count", 4)
     model_cfg.setdefault("noise_std", 0.05)
 
     ae_config = ActionPerceptionAEConfig.from_dict(model_cfg)
@@ -656,7 +666,12 @@ def train_v2(
             f"perception={ae_config.perception_layers} "
             f"decoder={ae_config.decoder_layers}"
         )
-        print(f"[action_ae_v2] mask_prob: {ae_config.mask_prob} noise_std: {ae_config.noise_std}")
+        print(
+            f"[action_ae_v2] mask_mode: {ae_config.mask_mode} "
+            f"mask_prob: {ae_config.mask_prob} "
+            f"mask_count: {ae_config.mask_count} "
+            f"noise_std: {ae_config.noise_std}"
+        )
 
     for step in range(1, max_steps + 1):
         model.train()

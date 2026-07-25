@@ -59,6 +59,20 @@ For the perception-conditioned v2 teacher:
 AE_VERSION=v2 MAX_STEPS=2 BATCH_SIZE=1 EVAL_BATCHES=1 WANDB_MODE=disabled /data/kaixi/PAIR/kaixi_scripts/train_action_ae.sh
 ```
 
+V2 supports the original independent random masking and fixed-length
+contiguous chunk masking:
+
+```bash
+# Independently mask each action step with probability 0.5.
+MASK_MODE=random MASK_PROB=0.5 /data/kaixi/PAIR/kaixi_scripts/train_action_ae.sh
+
+# Mask exactly four consecutive steps per sample.
+MASK_MODE=chunk MASK_COUNT=4 /data/kaixi/PAIR/kaixi_scripts/train_action_ae.sh
+```
+
+For chunk masking, each sample gets an independently sampled start position.
+The chunk never wraps around the action horizon, and `MASK_PROB` is ignored.
+
 Default full training uses all four LIBERO suites through
 `libero_4_task_suites_no_noops`, `BOUNDS_Q99` action normalization, and online
 WandB logging to `kaixi-university-of-maryland/PAIR`.
