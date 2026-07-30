@@ -34,6 +34,7 @@ PAIR_INIT_GATE_MODE="${PAIR_INIT_GATE_MODE:-learnable}" # learnable  fixed
 PAIR_INIT_GATE_VALUE="${PAIR_INIT_GATE_VALUE:-0}"
 PAIR_INIT_GATE_GRANULARITY="${PAIR_INIT_GATE_GRANULARITY:-per_step}"
 PAIR_GATE_ACTIVATION="${PAIR_GATE_ACTIVATION:-tanh}"
+PAIR_INJECTION_POSITIONS="${PAIR_INJECTION_POSITIONS:-start}"
 PAIR_LOG_DEBUG_METRICS="${PAIR_LOG_DEBUG_METRICS:-True}"
 
 PAIR_ACTION_AE_ENCODER_PATH="${PAIR_ACTION_AE_ENCODER_PATH:-/umd-datapool/kaixi/PAIR/action_ae_runs/conditionedAE_en2_de1_object/encoder_50000-steps.pt}"
@@ -176,6 +177,7 @@ cmd=(
     --pair_init_gate_value "${PAIR_INIT_GATE_VALUE}"
     --pair_init_gate_granularity "${PAIR_INIT_GATE_GRANULARITY}"
     --pair_gate_activation "${PAIR_GATE_ACTIVATION}"
+    --pair_injection_positions "${PAIR_INJECTION_POSITIONS}"
     --pair_log_debug_metrics "${PAIR_LOG_DEBUG_METRICS}"
 )
 
@@ -198,7 +200,7 @@ cat <<EOF
 [train_pair_bridge] action_ae_encoder: ${PAIR_ACTION_AE_ENCODER_PATH}
 [train_pair_bridge] pair_align_weight: ${PAIR_ALIGN_WEIGHT}
 [train_pair_bridge] pair_dims: bridge=${PAIR_BRIDGE_DIM}, block_mlp=4x_bridge, init_mlp=4x_bridge, gate_layers=${PAIR_GATE_NUM_LAYERS}, gate_mlp=${PAIR_GATE_MLP_DIM}
-[train_pair_bridge] pair_init_gate: mode=${PAIR_INIT_GATE_MODE}, actual_value=${PAIR_INIT_GATE_VALUE}, granularity=${PAIR_INIT_GATE_GRANULARITY}, activation=${PAIR_GATE_ACTIVATION}
+[train_pair_bridge] pair_init_gate: mode=${PAIR_INIT_GATE_MODE}, actual_value=${PAIR_INIT_GATE_VALUE}, granularity=${PAIR_INIT_GATE_GRANULARITY}, activation=${PAIR_GATE_ACTIVATION}, positions=${PAIR_INJECTION_POSITIONS}
 [train_pair_bridge] pair_log_debug_metrics: ${PAIR_LOG_DEBUG_METRICS}
 [train_pair_bridge] wandb: ${WANDB_ENTITY}/${WANDB_PROJECT} (${WANDB_MODE})
 [train_pair_bridge] exp_name: ${EXP_NAME}

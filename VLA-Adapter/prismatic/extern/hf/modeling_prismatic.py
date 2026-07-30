@@ -866,7 +866,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
         
         initial_action_states = None
-        initial_action_gate = None
+        pair_injection_gates = None
         if pair_bridge is not None:
             hidden0 = language_model_output.hidden_states[0]
             perception_tokens, perception_mask = build_pair_perception_tokens(
@@ -880,7 +880,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 perception_mask=perception_mask,
             )
             initial_action_states = pair_output.action_init_delta
-            initial_action_gate = pair_output.init_gate
+            pair_injection_gates = pair_output.injection_gates
 
         # Handle different prediction methods
         if action_head is not None:
@@ -889,7 +889,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                                                 proprio=proprio,
                                                 proprio_projector=proprio_projector,
                                                 initial_action_states=initial_action_states,
-                                                initial_action_gate=initial_action_gate)
+                                                pair_injection_gates=pair_injection_gates)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,31 @@ from torch import Tensor, nn
 
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 from prismatic.vla.constants import IGNORE_INDEX
+
+
+PAIR_INJECTION_POSITION_ORDER = ("start", "middle", "end")
+
+
+def normalize_pair_injection_positions(positions: str | Iterable[str]) -> tuple[str, ...]:
+    """Validate and canonicalize Action Expert PAIR injection positions."""
+    if isinstance(positions, str):
+        values = [value.strip().lower() for value in positions.split(",")]
+    else:
+        values = [str(value).strip().lower() for value in positions]
+
+    if not values or any(not value for value in values):
+        raise ValueError("PAIR injection positions must contain at least one of: start, middle, end.")
+    if len(set(values)) != len(values):
+        raise ValueError(f"Duplicate PAIR injection positions are not allowed: {values}")
+
+    unknown = sorted(set(values) - set(PAIR_INJECTION_POSITION_ORDER))
+    if unknown:
+        raise ValueError(
+            f"Unsupported PAIR injection positions {unknown}; expected start, middle, and/or end."
+        )
+
+    selected = set(values)
+    return tuple(position for position in PAIR_INJECTION_POSITION_ORDER if position in selected)
 
 
 @dataclass(frozen=True)
@@ -34,10 +59,16 @@ class PairBridgeConfig:
     input_dependent_gate: bool = True
     gate_activation: str = "sigmoid"
     init_gate_value_is_actual: bool = True
+    injection_positions: tuple[str, ...] = ("start",)
 
     def __post_init__(self) -> None:
         if self.gate_num_layers < 1:
             raise ValueError(f"gate_num_layers must be >= 1, got {self.gate_num_layers}")
+        object.__setattr__(
+            self,
+            "injection_positions",
+            normalize_pair_injection_positions(self.injection_positions),
+        )
         if self.bridge_mlp_dim is None:
             object.__setattr__(self, "bridge_mlp_dim", 4 * self.bridge_dim)
         if self.init_mlp_dim is None:
@@ -59,8 +90,21 @@ class PairBridgeOutput:
     bridge_tokens: Tensor
     z_align: Tensor
     action_init_delta: Tensor
-    init_gate: Tensor
-    init_gate_raw: Tensor
+    init_gate: Optional[Tensor]
+    init_gate_raw: Optional[Tensor]
+    injection_gates: Dict[str, Tensor]
+    injection_gates_raw: Dict[str, Tensor]
+
+
+class _StaticPairGate(nn.Module):
+    """A learnable parameter or fixed buffer for one injection position."""
+
+    def __init__(self, value: Tensor, *, learnable: bool) -> None:
+        super().__init__()
+        if learnable:
+            self.value = nn.Parameter(value)
+        else:
+            self.register_buffer("value", value)
 
 
 def build_pair_perception_tokens(
@@ -222,34 +266,38 @@ class PairBridge(nn.Module):
             and self.config.init_gate_mode == "learnable"
             and self.config.init_gate_granularity == "per_step"
         )
+        self.extra_gate_norms = nn.ModuleDict()
+        self.extra_gate_projs = nn.ModuleDict()
+        self.extra_static_gates = nn.ModuleDict()
         if self.uses_input_dependent_gate:
-            self.gate_norm = nn.LayerNorm(self.config.bridge_dim)
-            self.gate_proj = self._build_gate_projection()
+            if "start" in self.config.injection_positions:
+                # Preserve the original parameter names for start-only checkpoint compatibility.
+                self.gate_norm = nn.LayerNorm(self.config.bridge_dim)
+                self.gate_proj = self._build_gate_projection()
+            else:
+                self.gate_norm = None
+                self.gate_proj = None
+            for position in self.config.injection_positions:
+                if position == "start":
+                    continue
+                self.extra_gate_norms[position] = nn.LayerNorm(self.config.bridge_dim)
+                self.extra_gate_projs[position] = self._build_gate_projection()
         else:
             self.gate_norm = None
             self.gate_proj = None
-            init_gate_value = (
-                float(self.config.init_gate_value)
-                if self.config.init_gate_mode == "fixed"
-                else self._initial_gate_raw_value()
-            )
-            if self.config.init_gate_granularity == "scalar":
-                init_gate = torch.full((), init_gate_value)
-            elif self.config.init_gate_granularity == "per_step":
-                init_gate = torch.full((self.config.horizon,), init_gate_value)
-            else:
-                raise ValueError(
-                    "Unsupported init_gate_granularity="
-                    f"{self.config.init_gate_granularity!r}; expected 'scalar' or 'per_step'."
-                )
-            if self.config.init_gate_mode == "learnable":
-                self.init_gate = nn.Parameter(init_gate)
-            elif self.config.init_gate_mode == "fixed":
-                self.register_buffer("init_gate", init_gate)
-            else:
-                raise ValueError(
-                    f"Unsupported init_gate_mode={self.config.init_gate_mode!r}; expected 'learnable' or 'fixed'."
-                )
+            for position in self.config.injection_positions:
+                init_gate = self._build_static_gate_value()
+                if position == "start":
+                    # Preserve the original parameter/buffer name for old start-only checkpoints.
+                    if self.config.init_gate_mode == "learnable":
+                        self.init_gate = nn.Parameter(init_gate)
+                    else:
+                        self.register_buffer("init_gate", init_gate)
+                else:
+                    self.extra_static_gates[position] = _StaticPairGate(
+                        init_gate,
+                        learnable=self.config.init_gate_mode == "learnable",
+                    )
 
         self.reset_parameters()
 
@@ -277,6 +325,25 @@ class PairBridge(nn.Module):
             f"Unsupported gate_activation={self.config.gate_activation!r}; expected 'sigmoid' or 'tanh'."
         )
 
+    def _build_static_gate_value(self) -> Tensor:
+        if self.config.init_gate_mode not in {"learnable", "fixed"}:
+            raise ValueError(
+                f"Unsupported init_gate_mode={self.config.init_gate_mode!r}; expected 'learnable' or 'fixed'."
+            )
+        init_gate_value = (
+            float(self.config.init_gate_value)
+            if self.config.init_gate_mode == "fixed"
+            else self._initial_gate_raw_value()
+        )
+        if self.config.init_gate_granularity == "scalar":
+            return torch.full((), init_gate_value)
+        if self.config.init_gate_granularity == "per_step":
+            return torch.full((self.config.horizon,), init_gate_value)
+        raise ValueError(
+            "Unsupported init_gate_granularity="
+            f"{self.config.init_gate_granularity!r}; expected 'scalar' or 'per_step'."
+        )
+
     def _build_gate_projection(self) -> nn.Module:
         if self.config.gate_num_layers == 1:
             return nn.Linear(self.config.bridge_dim, 1, bias=True)
@@ -295,30 +362,68 @@ class PairBridge(nn.Module):
         layers.append(nn.Linear(self.config.gate_mlp_dim, 1, bias=True))
         return nn.Sequential(*layers)
 
-    def _gate_output_layer(self) -> nn.Linear:
-        if isinstance(self.gate_proj, nn.Linear):
-            return self.gate_proj
-        if isinstance(self.gate_proj, nn.Sequential) and isinstance(self.gate_proj[-1], nn.Linear):
-            return self.gate_proj[-1]
+    @staticmethod
+    def _gate_output_layer(gate_proj: nn.Module) -> nn.Linear:
+        if isinstance(gate_proj, nn.Linear):
+            return gate_proj
+        if isinstance(gate_proj, nn.Sequential) and isinstance(gate_proj[-1], nn.Linear):
+            return gate_proj[-1]
         raise TypeError("Input-dependent gate projection must end with an nn.Linear layer.")
+
+    def _input_gate_modules(self, position: str) -> tuple[nn.Module, nn.Module]:
+        if position == "start":
+            if self.gate_norm is None or self.gate_proj is None:
+                raise RuntimeError("Start gate modules were not initialized.")
+            return self.gate_norm, self.gate_proj
+        return self.extra_gate_norms[position], self.extra_gate_projs[position]
+
+    def _static_gate_value(self, position: str) -> Tensor:
+        if position == "start":
+            return self.init_gate
+        return self.extra_static_gates[position].value
+
+    def _gate_delta(self, gate: Tensor, delta: Tensor) -> Tensor:
+        if gate.ndim == 0:
+            return gate * delta
+        if gate.ndim == 1:
+            if gate.shape[0] != self.config.horizon:
+                raise ValueError(
+                    f"Expected per-step gate length {self.config.horizon}, got {gate.shape[0]}"
+                )
+            return gate.view(1, self.config.horizon, 1) * delta
+        if gate.ndim == 2:
+            if gate.shape != delta.shape[:2]:
+                raise ValueError(f"Expected batched gate shape {delta.shape[:2]}, got {gate.shape}")
+            return gate.unsqueeze(-1) * delta
+        raise ValueError(f"Unsupported gate shape: {tuple(gate.shape)}")
 
     def reset_parameters(self) -> None:
         nn.init.normal_(self.bridge_queries, mean=0.0, std=0.02)
         nn.init.normal_(self.bridge_pos_embed, mean=0.0, std=0.02)
         if self.uses_input_dependent_gate:
-            output_layer = self._gate_output_layer()
-            nn.init.zeros_(output_layer.weight)
-            nn.init.constant_(output_layer.bias, self._initial_gate_raw_value())
+            for position in self.config.injection_positions:
+                _, gate_proj = self._input_gate_modules(position)
+                output_layer = self._gate_output_layer(gate_proj)
+                nn.init.zeros_(output_layer.weight)
+                nn.init.constant_(output_layer.bias, self._initial_gate_raw_value())
 
     def keep_high_precision_params(self) -> None:
         """Keep small gate parameters in fp32 after bulk bf16 conversion."""
         if self.uses_input_dependent_gate:
-            self.gate_norm.float()
-            self.gate_proj.float()
-        elif isinstance(self.init_gate, nn.Parameter):
-            self.init_gate = nn.Parameter(self.init_gate.detach().float(), requires_grad=self.init_gate.requires_grad)
+            for position in self.config.injection_positions:
+                gate_norm, gate_proj = self._input_gate_modules(position)
+                gate_norm.float()
+                gate_proj.float()
         else:
-            self.init_gate = self.init_gate.detach().float()
+            if "start" in self.config.injection_positions:
+                if isinstance(self.init_gate, nn.Parameter):
+                    self.init_gate = nn.Parameter(
+                        self.init_gate.detach().float(),
+                        requires_grad=self.init_gate.requires_grad,
+                    )
+                else:
+                    self.init_gate = self.init_gate.detach().float()
+            self.extra_static_gates.float()
 
     def keep_init_gate_fp32(self) -> None:
         self.keep_high_precision_params()
@@ -362,32 +467,40 @@ class PairBridge(nn.Module):
 
         z_align = self.align_proj(bridge_tokens)
         action_init_delta = self.init_proj(bridge_tokens)
-        if self.uses_input_dependent_gate:
-            gate_raw = self.gate_proj(self.gate_norm(bridge_tokens.float())).squeeze(-1)
-            gate = self._activate_gate(gate_raw).to(dtype=action_init_delta.dtype)
-            gated_delta = gate.unsqueeze(-1) * action_init_delta
-        else:
-            gate_raw = self.init_gate
-            if self.config.init_gate_mode == "fixed" and self.config.init_gate_value_is_actual:
-                gate = self.init_gate.to(dtype=action_init_delta.dtype)
+        injection_gates: Dict[str, Tensor] = {}
+        injection_gates_raw: Dict[str, Tensor] = {}
+        gated_delta = torch.zeros_like(action_init_delta)
+        for position in self.config.injection_positions:
+            if self.uses_input_dependent_gate:
+                gate_norm, gate_proj = self._input_gate_modules(position)
+                gate_raw = gate_proj(gate_norm(bridge_tokens.float())).squeeze(-1)
+                gate = self._activate_gate(gate_raw).to(dtype=action_init_delta.dtype)
             else:
-                gate = self._activate_gate(self.init_gate).to(dtype=action_init_delta.dtype)
-            if gate.ndim == 0:
-                gated_delta = gate * action_init_delta
-            else:
-                gated_delta = gate.view(1, self.config.horizon, 1) * action_init_delta
+                gate_raw = self._static_gate_value(position)
+                if self.config.init_gate_mode == "fixed" and self.config.init_gate_value_is_actual:
+                    gate = gate_raw.to(dtype=action_init_delta.dtype)
+                else:
+                    gate = self._activate_gate(gate_raw).to(dtype=action_init_delta.dtype)
+            injection_gates[position] = gate
+            injection_gates_raw[position] = gate_raw
+            gated_delta = gated_delta + self._gate_delta(gate, action_init_delta)
+
         if base_action_init is None:
             action_init = gated_delta
         else:
             action_init = base_action_init.to(dtype=gated_delta.dtype) + gated_delta
+
+        expose_start_alias = self.config.injection_positions == ("start",)
 
         return PairBridgeOutput(
             action_init=action_init,
             bridge_tokens=bridge_tokens,
             z_align=z_align,
             action_init_delta=action_init_delta,
-            init_gate=gate,
-            init_gate_raw=gate_raw,
+            init_gate=injection_gates["start"] if expose_start_alias else None,
+            init_gate_raw=injection_gates_raw["start"] if expose_start_alias else None,
+            injection_gates=injection_gates,
+            injection_gates_raw=injection_gates_raw,
         )
 
 

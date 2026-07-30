@@ -97,6 +97,7 @@ class GenerateConfig:
     num_images_in_input: int = 2                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = True                         # Whether to include proprio state in input
     use_pair_bridge: bool = False                    # Auto-enabled when checkpoint contains PAIR bridge
+    pair_injection_positions: str = "start"           # Informational; PAIR checkpoint remains authoritative
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
@@ -113,6 +114,10 @@ class GenerateConfig:
     num_trials_per_task: int = 50                    # Number of rollouts per task
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
+    start_task_id: int = 0                           # Resume from this zero-based LIBERO task index
+    start_episode_idx: int = 0                       # Resume from this zero-based trial in start_task_id
+    initial_total_episodes: int = 0                  # Completed episodes carried into resumed totals
+    initial_total_successes: int = 0                 # Completed successes carried into resumed totals
 
     #################################################################################################################
     # Utils
@@ -142,6 +147,7 @@ MODEL_CONFIG_KEYS = {
     "num_images_in_input",
     "use_proprio",
     "use_pair_bridge",
+    "pair_injection_positions",
     "center_crop",
     "num_open_loop_steps",
     "load_in_8bit",
@@ -178,6 +184,14 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    assert cfg.start_task_id >= 0, "start_task_id must be non-negative!"
+    assert 0 <= cfg.start_episode_idx < cfg.num_trials_per_task, (
+        "start_episode_idx must be in [0, num_trials_per_task)!"
+    )
+    assert cfg.initial_total_episodes >= 0, "initial_total_episodes must be non-negative!"
+    assert 0 <= cfg.initial_total_successes <= cfg.initial_total_episodes, (
+        "initial_total_successes must be in [0, initial_total_episodes]!"
+    )
 
 
 
@@ -428,7 +442,8 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
-    save_version=None
+    save_version=None,
+    start_episode_idx=0,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -443,7 +458,7 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    for episode_idx in tqdm.tqdm(range(start_episode_idx, cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -463,7 +478,7 @@ def run_task(
             # Get initial state
             initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
-        log_message(f"Starting episode {task_episodes + 1}...", log_file)
+        log_message(f"Starting episode {episode_idx + 1}...", log_file)
 
         # Run episode
         success, replay_images = run_episode(
@@ -556,8 +571,21 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
     # Start evaluation
-    total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    if cfg.start_task_id >= num_tasks:
+        raise ValueError(
+            f"start_task_id={cfg.start_task_id} is outside task suite with {num_tasks} tasks"
+        )
+    total_episodes = cfg.initial_total_episodes
+    total_successes = cfg.initial_total_successes
+    if cfg.start_task_id or cfg.start_episode_idx or total_episodes:
+        log_message(
+            "Resuming eval from "
+            f"task_id={cfg.start_task_id}, episode_idx={cfg.start_episode_idx}, "
+            f"initial totals={total_successes}/{total_episodes}",
+            log_file,
+        )
+    for task_id in tqdm.tqdm(range(cfg.start_task_id, num_tasks)):
+        task_start_episode_idx = cfg.start_episode_idx if task_id == cfg.start_task_id else 0
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,
@@ -572,7 +600,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
-            cfg.save_version
+            cfg.save_version,
+            task_start_episode_idx,
         )
 
     # Calculate final success rate

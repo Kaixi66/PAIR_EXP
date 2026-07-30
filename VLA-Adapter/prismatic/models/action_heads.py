@@ -5,6 +5,8 @@ Implementations of various action heads, which serve as alternatives to VLM sequ
 """
 
 import math
+from collections.abc import Mapping
+
 import torch
 import torch.nn as nn
 from prismatic.vla.constants import ACTION_DIM, ACTION_TOKEN_BEGIN_IDX, IGNORE_INDEX, NUM_ACTIONS_CHUNK, PROPRIO_DIM, STOP_INDEX, NUM_TOKENS
@@ -48,6 +50,7 @@ class L1RegressionActionHead(nn.Module):
             phase="Inference",
             initial_action_states=None,
             initial_action_gate=None,
+            pair_injection_gates=None,
             ):
         batch_size = actions_hidden_states.shape[0]
         device = actions_hidden_states.device
@@ -74,7 +77,20 @@ class L1RegressionActionHead(nn.Module):
         ).detach()
         pair_init_hidden_states = None
         if initial_action_states is not None:
-            if initial_action_gate is None:
+            if pair_injection_gates is not None:
+                if initial_action_gate is not None:
+                    raise ValueError("Provide pair_injection_gates or initial_action_gate, not both.")
+                expected_shape = (batch_size, NUM_ACTIONS_CHUNK, self.hidden_dim)
+                if tuple(initial_action_states.shape) != expected_shape:
+                    raise ValueError(
+                        f"Expected PAIR action states with shape {expected_shape}, "
+                        f"got {tuple(initial_action_states.shape)}"
+                    )
+                pair_init_hidden_states = initial_action_states.to(
+                    device=device,
+                    dtype=actions_hidden_states.dtype,
+                )
+            elif initial_action_gate is None:
                 expected_shape = (batch_size, self.action_dim * NUM_ACTIONS_CHUNK, self.hidden_dim)
                 if tuple(initial_action_states.shape) != expected_shape:
                     raise ValueError(
@@ -112,6 +128,7 @@ class L1RegressionActionHead(nn.Module):
             h_t=task_hidden_states,
             pair_init=pair_rearranged_action_states,
             pair_gate=initial_action_gate,
+            pair_gates=pair_injection_gates,
             )
 
         return action
@@ -144,28 +161,71 @@ class MLPResNet(nn.Module):
         self.fc2 = nn.Linear(hidden_dim, output_dim)
 
 
-    def forward(self, x, h_a=None, h_t=None, p= None, pair_init=None, pair_gate=None):
+    @staticmethod
+    def _apply_pair_injection(x, pair_init, gate, position):
+        pair_x = pair_init.to(device=x.device, dtype=x.dtype)
+        if pair_x.shape != x.shape:
+            raise ValueError(
+                f"Expected {position} PAIR delta with shape {tuple(x.shape)}, got {tuple(pair_x.shape)}"
+            )
+        gate = gate.to(device=x.device, dtype=x.dtype) if torch.is_tensor(gate) else x.new_tensor(gate)
+        if gate.ndim == 1:
+            if gate.shape[0] != x.shape[1]:
+                raise ValueError(f"Expected per-step {position} gate with length {x.shape[1]}, got {gate.shape[0]}")
+            gate = gate.view(1, -1, 1)
+        elif gate.ndim == 2:
+            if gate.shape != x.shape[:2]:
+                raise ValueError(
+                    f"Expected batched {position} gate with shape {x.shape[:2]}, got {gate.shape}"
+                )
+            gate = gate.unsqueeze(-1)
+        elif gate.ndim != 0:
+            raise ValueError(
+                f"Expected scalar, per-step, or batched per-step {position} gate, got shape {gate.shape}"
+            )
+        return x + gate * pair_x
+
+    def forward(
+        self,
+        x,
+        h_a=None,
+        h_t=None,
+        p=None,
+        pair_init=None,
+        pair_gate=None,
+        pair_gates=None,
+    ):
  
         # x: (batch_size, input_dim)
         x = self.layer_norm1(x)  # shape: (batch_size, input_dim)
         x = self.fc1(x)  # shape: (batch_size, hidden_dim)
         x = self.relu(x)  # shape: (batch_size, hidden_dim)
+
+        if pair_gates is not None and pair_gate is not None:
+            raise ValueError("Provide pair_gates or pair_gate, not both.")
+        if pair_gates is None:
+            pair_gates = {} if pair_gate is None else {"start": pair_gate}
+        if not isinstance(pair_gates, Mapping):
+            raise TypeError(f"pair_gates must be a mapping, got {type(pair_gates).__name__}")
+        unknown_positions = set(pair_gates) - {"start", "middle", "end"}
+        if unknown_positions:
+            raise ValueError(f"Unsupported PAIR injection positions: {sorted(unknown_positions)}")
+        if pair_gates and pair_init is None:
+            raise ValueError("PAIR gates were provided without a PAIR delta.")
+
         if pair_init is not None:
-            pair_x = pair_init.to(device=x.device, dtype=x.dtype)
-            gate = pair_gate.to(device=x.device, dtype=x.dtype) if torch.is_tensor(pair_gate) else x.new_tensor(pair_gate)
-            if gate.ndim == 1:
-                if gate.shape[0] != x.shape[1]:
-                    raise ValueError(f"Expected per-step pair gate with length {x.shape[1]}, got {gate.shape[0]}")
-                gate = gate.view(1, -1, 1)
-            elif gate.ndim == 2:
-                if gate.shape != x.shape[:2]:
-                    raise ValueError(f"Expected batched per-step pair gate with shape {x.shape[:2]}, got {gate.shape}")
-                gate = gate.unsqueeze(-1)
-            elif gate.ndim != 0:
-                raise ValueError(f"Expected scalar, per-step, or batched per-step pair gate, got shape {gate.shape}")
-            x = x + gate * pair_x
+            if "start" in pair_gates:
+                x = self._apply_pair_injection(x, pair_init, pair_gates["start"], "start")
+
+        middle_after_block = len(self.mlp_resnet_blocks) // 2
         for i, block in enumerate(self.mlp_resnet_blocks):
             x = block(x, h_t = h_t[:,i+1,:], h_a = h_a[:,i+1,:], p=p)  # shape: (batch_size, hidden_dim)
+            if pair_init is not None and i + 1 == middle_after_block and "middle" in pair_gates:
+                x = self._apply_pair_injection(x, pair_init, pair_gates["middle"], "middle")
+
+        if pair_init is not None and "end" in pair_gates:
+            x = self._apply_pair_injection(x, pair_init, pair_gates["end"], "end")
+
         x = self.layer_norm2(x)  # shape: (batch_size, hidden_dim)
         x = self.fc2(x)  # shape: (batch_size, output_dim)
         return x   

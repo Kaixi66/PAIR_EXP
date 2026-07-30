@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import pytest
 import torch
 
 from prismatic.models.pair_bridge import (
@@ -9,6 +10,7 @@ from prismatic.models.pair_bridge import (
     build_pair_perception_tokens,
     cosine_alignment_loss,
     load_pair_bridge_checkpoint,
+    normalize_pair_injection_positions,
     save_pair_bridge_checkpoint,
 )
 from prismatic.vla.constants import IGNORE_INDEX
@@ -83,6 +85,205 @@ def test_pair_bridge_two_layer_gate_config():
     assert dict(bridge.named_parameters())["gate_proj.0.weight"].shape == (16, 32)
     assert dict(bridge.named_parameters())["gate_proj.2.weight"].shape == (1, 16)
     assert torch.count_nonzero(bridge.gate_proj[2].weight) == 0
+
+
+def test_pair_injection_positions_are_canonicalized():
+    assert normalize_pair_injection_positions("end, start,middle") == (
+        "start",
+        "middle",
+        "end",
+    )
+    assert normalize_pair_injection_positions(["MIDDLE", "end"]) == ("middle", "end")
+
+
+@pytest.mark.parametrize(
+    "positions",
+    ["", "start,", ",middle", "start,start", "start,vlm"],
+)
+def test_pair_injection_positions_reject_invalid_values(positions):
+    with pytest.raises(ValueError):
+        normalize_pair_injection_positions(positions)
+
+
+def test_pair_bridge_multi_position_gates_are_independent():
+    torch.manual_seed(29)
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+        injection_positions=("end", "start", "middle"),
+    )
+    bridge = PairBridge(config)
+    perception_tokens = torch.randn(2, 6, 64)
+
+    output_before = bridge(perception_tokens)
+
+    assert bridge.config.injection_positions == ("start", "middle", "end")
+    assert tuple(output_before.injection_gates) == ("start", "middle", "end")
+    assert all(gate.shape == (2, 8) for gate in output_before.injection_gates.values())
+    assert output_before.init_gate is None
+    assert output_before.init_gate_raw is None
+    assert bridge.gate_proj is not bridge.extra_gate_projs["middle"]
+    assert bridge.extra_gate_projs["middle"] is not bridge.extra_gate_projs["end"]
+
+    with torch.no_grad():
+        bridge.gate_proj.bias.add_(1.0)
+    output_after = bridge(perception_tokens)
+
+    assert not torch.allclose(
+        output_before.injection_gates["start"],
+        output_after.injection_gates["start"],
+    )
+    assert torch.allclose(
+        output_before.injection_gates["middle"],
+        output_after.injection_gates["middle"],
+    )
+    assert torch.allclose(
+        output_before.injection_gates["end"],
+        output_after.injection_gates["end"],
+    )
+
+
+def test_pair_bridge_multi_position_delta_and_gates_receive_gradients():
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+        injection_positions=("start", "middle", "end"),
+    )
+    bridge = PairBridge(config)
+    output = bridge(torch.randn(2, 6, 64))
+
+    output.action_init.float().sum().backward()
+
+    assert bridge.init_proj[3].weight.grad is not None
+    assert bridge.init_proj[3].weight.grad.abs().sum() > 0
+    assert bridge.gate_proj.bias.grad is not None
+    assert bridge.gate_proj.bias.grad.abs().sum() > 0
+    assert bridge.extra_gate_projs["middle"].bias.grad is not None
+    assert bridge.extra_gate_projs["middle"].bias.grad.abs().sum() > 0
+    assert bridge.extra_gate_projs["end"].bias.grad is not None
+    assert bridge.extra_gate_projs["end"].bias.grad.abs().sum() > 0
+
+
+def test_pair_bridge_multi_position_checkpoint_round_trip(tmp_path: Path):
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+        injection_positions=("middle", "end"),
+    )
+    bridge = PairBridge(config)
+    checkpoint = tmp_path / "multi_pair_bridge.pt"
+    save_pair_bridge_checkpoint(
+        path=checkpoint,
+        pair_bridge=bridge,
+        config=config,
+        action_ae_encoder_path="/tmp/encoder.pt",
+    )
+
+    loaded = load_pair_bridge_checkpoint(checkpoint)
+
+    assert loaded.config.injection_positions == ("middle", "end")
+    assert tuple(loaded(torch.randn(1, 6, 64)).injection_gates) == ("middle", "end")
+    assert set(loaded.state_dict()) == set(bridge.state_dict())
+
+
+def test_pair_bridge_old_checkpoint_defaults_to_start(tmp_path: Path):
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+    )
+    bridge = PairBridge(config)
+    checkpoint = tmp_path / "old_pair_bridge.pt"
+    old_model_config = config.to_dict()
+    old_model_config.pop("injection_positions")
+    torch.save(
+        {
+            "model_type": "PairBridge",
+            "model_config": old_model_config,
+            "action_ae_encoder_path": "/tmp/encoder.pt",
+            "state_dict": bridge.state_dict(),
+            "metadata": {},
+        },
+        checkpoint,
+    )
+
+    loaded = load_pair_bridge_checkpoint(checkpoint)
+
+    assert loaded.config.injection_positions == ("start",)
+    assert "gate_proj.weight" in loaded.state_dict()
+    assert tuple(loaded(torch.randn(1, 6, 64)).injection_gates) == ("start",)
+
+
+def test_pair_bridge_old_static_gate_checkpoint_defaults_to_start(tmp_path: Path):
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+        input_dependent_gate=False,
+        init_gate_mode="learnable",
+        init_gate_granularity="per_step",
+    )
+    bridge = PairBridge(config)
+    checkpoint = tmp_path / "old_static_pair_bridge.pt"
+    old_model_config = config.to_dict()
+    old_model_config.pop("injection_positions")
+    torch.save(
+        {
+            "model_type": "PairBridge",
+            "model_config": old_model_config,
+            "action_ae_encoder_path": "/tmp/encoder.pt",
+            "state_dict": bridge.state_dict(),
+            "metadata": {},
+        },
+        checkpoint,
+    )
+
+    loaded = load_pair_bridge_checkpoint(checkpoint)
+
+    assert loaded.config.injection_positions == ("start",)
+    assert "init_gate" in loaded.state_dict()
+    assert tuple(loaded(torch.randn(1, 6, 64)).injection_gates) == ("start",)
+
+
+def test_pair_bridge_fixed_multi_position_gates():
+    config = PairBridgeConfig(
+        llm_dim=64,
+        bridge_dim=32,
+        latent_dim=8,
+        horizon=8,
+        action_dim=7,
+        num_heads=4,
+        init_gate_mode="fixed",
+        init_gate_value=0.25,
+        init_gate_granularity="scalar",
+        injection_positions=("start", "end"),
+    )
+    bridge = PairBridge(config)
+
+    output = bridge(torch.randn(2, 6, 64))
+
+    assert torch.allclose(output.injection_gates["start"], torch.tensor(0.25))
+    assert torch.allclose(output.injection_gates["end"], torch.tensor(0.25))
+    assert "init_gate" in dict(bridge.named_buffers())
+    assert "extra_static_gates.end.value" in dict(bridge.named_buffers())
 
 
 def test_pair_perception_helper_training_and_inference_masks():

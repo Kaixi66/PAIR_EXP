@@ -67,6 +67,7 @@ try:
         alignment_loss,
         build_pair_perception_tokens,
         load_frozen_action_encoder,
+        normalize_pair_injection_positions,
         save_pair_bridge_checkpoint,
     )
 except ImportError:
@@ -75,6 +76,7 @@ except ImportError:
     alignment_loss = None
     build_pair_perception_tokens = None
     load_frozen_action_encoder = None
+    normalize_pair_injection_positions = None
     save_pair_bridge_checkpoint = None
 
 
@@ -159,6 +161,7 @@ class FinetuneConfig:
     pair_init_gate_value: float = 0.05
     pair_init_gate_granularity: str = "per_step"
     pair_gate_activation: str = "sigmoid"
+    pair_injection_positions: str = "start"
     pair_log_debug_metrics: bool = False
     # fmt: on
 
@@ -513,11 +516,11 @@ def run_forward_pass(
         multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
 
         initial_action_states = None
-        initial_action_gate = None
+        pair_injection_gates = None
         pair_align_loss = None
         pair_lambda = 0.0
-        pair_init_gate = None
-        pair_init_gate_raw = None
+        pair_injection_gates_float = None
+        pair_injection_gates_raw_float = None
         if cfg is not None and cfg.use_pair_bridge:
             if pair_bridge is None or action_ae_encoder is None:
                 raise ValueError("PAIR bridge is enabled but pair_bridge/action_ae_encoder was not provided.")
@@ -533,7 +536,7 @@ def run_forward_pass(
                 perception_mask=perception_mask,
             )
             initial_action_states = pair_output.action_init_delta
-            initial_action_gate = pair_output.init_gate
+            pair_injection_gates = pair_output.injection_gates
             with torch.no_grad():
                 if getattr(action_ae_encoder, "requires_perception", False):
                     action_latents = action_ae_encoder(
@@ -550,8 +553,14 @@ def run_forward_pass(
                 loss_type=cfg.pair_align_loss_type,
             )
             pair_lambda = float(cfg.pair_align_weight)
-            pair_init_gate = pair_output.init_gate.detach().float()
-            pair_init_gate_raw = pair_output.init_gate_raw.detach().float()
+            pair_injection_gates_float = {
+                position: gate.detach().float()
+                for position, gate in pair_output.injection_gates.items()
+            }
+            pair_injection_gates_raw_float = {
+                position: gate.detach().float()
+                for position, gate in pair_output.injection_gates_raw.items()
+            }
 
         predicted_actions = action_head.module.predict_action(
             multi_layer_hidden_states,
@@ -559,7 +568,7 @@ def run_forward_pass(
             proprio_projector=proprio_projector if use_proprio else None,
             phase=cfg.phase,
             initial_action_states=initial_action_states,
-            initial_action_gate=initial_action_gate,
+            pair_injection_gates=pair_injection_gates,
             )
 
         action_l1_loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
@@ -576,42 +585,50 @@ def run_forward_pass(
         if pair_align_loss is not None:
             pair_delta = pair_output.action_init_delta.detach().float()
             pair_delta_norm = pair_delta.norm(dim=-1)
-            if pair_init_gate.ndim == 0:
-                pair_effective_delta_norm = (pair_init_gate.abs() * pair_delta_norm).mean()
-            elif pair_init_gate.ndim == 1:
-                pair_effective_delta_norm = (pair_init_gate.abs().view(1, -1) * pair_delta_norm).mean()
-            else:
-                pair_effective_delta_norm = (pair_init_gate.abs() * pair_delta_norm).mean()
-            pair_init_gate_values = pair_init_gate.reshape(-1)
             pair_metrics = {
                 "pair/align_loss": pair_align_loss.item(),
-                "pair/init_gate": pair_init_gate_values.mean().item(),
-                "pair/init_gate_std": pair_init_gate_values.std(unbiased=False).item(),
+                "pair/injection_count": float(len(pair_injection_gates_float)),
+                "pair/init_delta_norm": pair_delta_norm.mean().item(),
+                "pair/z_align_norm": pair_output.z_align.detach().float().norm(dim=-1).mean().item(),
             }
-            if cfg.pair_log_debug_metrics:
-                if pair_init_gate.ndim == 0:
-                    pair_step_gate = pair_init_gate.expand(NUM_ACTIONS_CHUNK)
-                elif pair_init_gate.ndim == 1:
-                    pair_step_gate = pair_init_gate
+            for position, position_gate in pair_injection_gates_float.items():
+                if position_gate.ndim == 0:
+                    effective_delta_norm = (position_gate.abs() * pair_delta_norm).mean()
+                    step_gate = position_gate.expand(NUM_ACTIONS_CHUNK)
+                elif position_gate.ndim == 1:
+                    effective_delta_norm = (
+                        position_gate.abs().view(1, -1) * pair_delta_norm
+                    ).mean()
+                    step_gate = position_gate
                 else:
-                    pair_step_gate = pair_init_gate.mean(dim=0)
+                    effective_delta_norm = (position_gate.abs() * pair_delta_norm).mean()
+                    step_gate = position_gate.mean(dim=0)
+                gate_values = position_gate.reshape(-1)
                 pair_metrics.update(
                     {
-                        "pair/lambda": pair_lambda,
-                        "pair/init_gate_raw": pair_init_gate_raw.mean().item(),
-                        "pair/init_gate_min": pair_init_gate_values.min().item(),
-                        "pair/init_gate_max": pair_init_gate_values.max().item(),
-                        "pair/init_delta_norm": pair_output.action_init_delta.detach().float().norm(dim=-1).mean().item(),
-                        "pair/init_effective_delta_norm": pair_effective_delta_norm.item(),
-                        "pair/z_align_norm": pair_output.z_align.detach().float().norm(dim=-1).mean().item(),
+                        f"pair/gate_{position}": gate_values.mean().item(),
+                        f"pair/gate_{position}_std": gate_values.std(unbiased=False).item(),
+                        f"pair/gate_{position}_min": gate_values.min().item(),
+                        f"pair/gate_{position}_max": gate_values.max().item(),
+                        f"pair/gate_{position}_raw": pair_injection_gates_raw_float[
+                            position
+                        ].mean().item(),
+                        f"pair/effective_delta_norm_{position}": effective_delta_norm.item(),
                     }
                 )
                 pair_metrics.update(
                     {
-                        f"pair/init_gate_step_{step_idx}": pair_step_gate[step_idx].item()
-                        for step_idx in range(min(NUM_ACTIONS_CHUNK, pair_step_gate.shape[0]))
+                        f"pair/gate_{position}_step_{step_idx}": step_gate[step_idx].item()
+                        for step_idx in range(min(NUM_ACTIONS_CHUNK, step_gate.shape[0]))
                     }
                 )
+            if "start" in pair_injection_gates_float:
+                # Preserve the original top-level metric names for existing dashboards.
+                start_values = pair_injection_gates_float["start"].reshape(-1)
+                pair_metrics["pair/init_gate"] = start_values.mean().item()
+                pair_metrics["pair/init_gate_std"] = start_values.std(unbiased=False).item()
+            if cfg.pair_log_debug_metrics:
+                pair_metrics["pair/lambda"] = pair_lambda
             metrics.update(pair_metrics)
 
         # Get detailed L1 losses for logging
@@ -700,6 +717,7 @@ def save_eval_model_config(cfg: FinetuneConfig, checkpoint_dir: Path) -> None:
             "load_in_8bit": False,
             "load_in_4bit": False,
             "use_pro_version": cfg.use_pro_version,
+            "pair_injection_positions": cfg.pair_injection_positions,
         },
         "training_context": {
             "dataset_name": cfg.dataset_name,
@@ -709,6 +727,7 @@ def save_eval_model_config(cfg: FinetuneConfig, checkpoint_dir: Path) -> None:
             "lora_rank": cfg.lora_rank,
             "pair_align_loss_type": cfg.pair_align_loss_type,
             "pair_align_weight": cfg.pair_align_weight,
+            "pair_injection_positions": cfg.pair_injection_positions,
         },
     }
     with open(checkpoint_dir / "vla_adapter_eval_config.json", "w") as f:
@@ -804,6 +823,7 @@ def save_training_checkpoint(
                     "run_id": checkpoint_dir.name,
                     "align_loss_type": cfg.pair_align_loss_type,
                     "align_weight": cfg.pair_align_weight,
+                    "injection_positions": list(pair_config.injection_positions),
                 },
             )
 
@@ -960,6 +980,11 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.pair_align_loss_type not in {"cosine", "l2"}:
         raise ValueError(
             f"Unsupported pair_align_loss_type={cfg.pair_align_loss_type!r}; expected 'cosine' or 'l2'."
+        )
+    if cfg.use_pair_bridge:
+        require_pair_bridge_imports()
+        cfg.pair_injection_positions = ",".join(
+            normalize_pair_injection_positions(cfg.pair_injection_positions)
         )
 
     # GPU setup
@@ -1187,6 +1212,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             init_gate_granularity=cfg.pair_init_gate_granularity,
             gate_activation=cfg.pair_gate_activation,
             init_gate_value_is_actual=True,
+            injection_positions=normalize_pair_injection_positions(cfg.pair_injection_positions),
         )
         pair_bridge = init_module(
             PairBridge,
@@ -1313,25 +1339,40 @@ def finetune(cfg: FinetuneConfig) -> None:
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "pair/align_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "pair/injection_count": deque(maxlen=cfg.grad_accumulation_steps),
+        "pair/init_delta_norm": deque(maxlen=cfg.grad_accumulation_steps),
+        "pair/z_align_norm": deque(maxlen=cfg.grad_accumulation_steps),
         "pair/init_gate": deque(maxlen=cfg.grad_accumulation_steps),
         "pair/init_gate_std": deque(maxlen=cfg.grad_accumulation_steps),
     }
+    configured_pair_positions = (
+        normalize_pair_injection_positions(cfg.pair_injection_positions)
+        if cfg.use_pair_bridge
+        else ()
+    )
+    for position in configured_pair_positions:
+        recent_metrics.update(
+            {
+                f"pair/gate_{position}": deque(maxlen=cfg.grad_accumulation_steps),
+                f"pair/gate_{position}_std": deque(maxlen=cfg.grad_accumulation_steps),
+                f"pair/gate_{position}_min": deque(maxlen=cfg.grad_accumulation_steps),
+                f"pair/gate_{position}_max": deque(maxlen=cfg.grad_accumulation_steps),
+                f"pair/gate_{position}_raw": deque(maxlen=cfg.grad_accumulation_steps),
+                f"pair/effective_delta_norm_{position}": deque(maxlen=cfg.grad_accumulation_steps),
+                **{
+                    f"pair/gate_{position}_step_{step_idx}": deque(
+                        maxlen=cfg.grad_accumulation_steps
+                    )
+                    for step_idx in range(NUM_ACTIONS_CHUNK)
+                },
+            }
+        )
     if cfg.pair_log_debug_metrics:
         recent_metrics.update(
             {
                 "curr_action_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
                 "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
                 "pair/lambda": deque(maxlen=cfg.grad_accumulation_steps),
-                "pair/init_gate_raw": deque(maxlen=cfg.grad_accumulation_steps),
-                "pair/init_gate_min": deque(maxlen=cfg.grad_accumulation_steps),
-                "pair/init_gate_max": deque(maxlen=cfg.grad_accumulation_steps),
-                "pair/init_delta_norm": deque(maxlen=cfg.grad_accumulation_steps),
-                "pair/init_effective_delta_norm": deque(maxlen=cfg.grad_accumulation_steps),
-                "pair/z_align_norm": deque(maxlen=cfg.grad_accumulation_steps),
-                **{
-                    f"pair/init_gate_step_{step_idx}": deque(maxlen=cfg.grad_accumulation_steps)
-                    for step_idx in range(NUM_ACTIONS_CHUNK)
-                },
             }
         )
 
