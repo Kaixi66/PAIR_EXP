@@ -8,7 +8,7 @@ format to OpenVLA, IterableDataset shim.
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 import numpy as np
 import random
 import torch
@@ -154,6 +154,9 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        validation_split_percent: int = 0,
+        seed: int = 0,
+        validation_shuffle_buffer_size: Optional[int] = None,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -180,12 +183,14 @@ class RLDSDataset(IterableDataset):
             load_language=True,
             action_proprio_normalization_type=ACTION_PROPRIO_NORMALIZATION_TYPE,
         )
+        for dataset_kwargs in per_dataset_kwargs:
+            dataset_kwargs["validation_split_percent"] = validation_split_percent
         rlds_config = dict(
             traj_transform_kwargs=dict(
                 window_size=1,                                      # If we wanted to feed / predict more than one step
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
-                goal_relabeling_strategy="uniform",                 # Goals are currently unused
+                goal_relabeling_strategy="uniform" if train else None,  # Keep validation free of random relabeling
             ),
             frame_transform_kwargs=dict(
                 resize_size=resize_resolution,
@@ -198,6 +203,8 @@ class RLDSDataset(IterableDataset):
             traj_transform_threads=len(mixture_spec),
             traj_read_threads=len(mixture_spec),
             train=train,
+            seed=seed,
+            validation_shuffle_buffer_size=validation_shuffle_buffer_size,
         )
 
         # If applicable, enable image augmentations

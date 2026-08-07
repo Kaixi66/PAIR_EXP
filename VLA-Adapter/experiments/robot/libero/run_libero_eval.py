@@ -118,6 +118,7 @@ class GenerateConfig:
     start_episode_idx: int = 0                       # Resume from this zero-based trial in start_task_id
     initial_total_episodes: int = 0                  # Completed episodes carried into resumed totals
     initial_total_successes: int = 0                 # Completed successes carried into resumed totals
+    save_rollouts: bool = True                       # Save per-episode MP4 replay videos
 
     #################################################################################################################
     # Utils
@@ -503,10 +504,16 @@ def run_task(
             task_successes += 1
             total_successes += 1
 
-        # Save replay video
-        save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file, save_version=save_version
-        )
+        # Save replay video when requested. Disabling this avoids large optional artifacts during batch evaluation.
+        if cfg.save_rollouts:
+            save_rollout_video(
+                replay_images,
+                total_episodes,
+                success=success,
+                task_description=task_description,
+                log_file=log_file,
+                save_version=save_version,
+            )
 
         # Log results
         log_message(f"Success: {success}", log_file)

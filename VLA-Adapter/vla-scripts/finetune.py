@@ -118,7 +118,14 @@ class FinetuneConfig:
     max_steps: int = 200000                          # Max number of training steps
     use_val_set: bool = False                        # If True, uses validation set and log validation metrics
     val_freq: int = 10_000                           # (When `use_val_set==True`) Validation set logging frequency in steps
-    val_time_limit: int = 180                        # (When `use_val_set==True`) Time limit for computing validation metrics
+    val_num_batches: int = 100                       # Fixed validation batches per rank/checkpoint
+    val_seed: int = 0                                # Seed for deterministic validation mixture ordering
+    val_shuffle_buffer_size: int = 10_000            # One-time fixed-seed sampling pool for validation
+    val_time_limit: int = 180                        # Deprecated compatibility option; fixed batches are used instead
+    val_split_percent: int = 5                       # Hold out this share of train if no native val split exists
+    save_best_val_checkpoint: bool = False           # Overwrite one best-val checkpoint when validation improves
+    best_val_metric: str = "action_l1_loss"         # Validation metric minimized for best-checkpoint selection
+    val_metrics_filename: str = "validation_metrics.jsonl"  # Local validation history under the run directory
     save_freq: int = 10_000                          # Checkpoint saving frequency in steps
     save_latest_checkpoint_only: bool = False        # If True, saves only 1 checkpoint, overwriting latest checkpoint
                                                      #   (If False, saves all checkpoints)
@@ -640,9 +647,6 @@ def run_forward_pass(
             predicted_next_actions = predicted_actions[:, 1:]
             curr_action_l1_loss = torch.nn.L1Loss()(ground_truth_curr_action, predicted_curr_action)
             next_actions_l1_loss = torch.nn.L1Loss()(ground_truth_next_actions, predicted_next_actions)
-            if compute_diffusion_l1:
-                print('curr: ',curr_action_l1_loss.item())
-                # print('next: ',next_actions_l1_loss.item())
 
             metrics.update(
                 {
@@ -748,6 +752,8 @@ def save_training_checkpoint(
     train_dataset,
     distributed_state,
     new_state_dict,
+    checkpoint_dir_override=None,
+    checkpoint_name_suffix_override=None,
     
 ) -> None:
     """
@@ -769,7 +775,10 @@ def save_training_checkpoint(
         None.
     """
     # Determine checkpoint paths and naming
-    if cfg.save_latest_checkpoint_only:
+    if checkpoint_dir_override is not None:
+        checkpoint_dir = Path(checkpoint_dir_override)
+        checkpoint_name_suffix = checkpoint_name_suffix_override or f"{log_step}_checkpoint.pt"
+    elif cfg.save_latest_checkpoint_only:
         checkpoint_dir = run_dir
         checkpoint_name_suffix = "latest_checkpoint.pt"
     else:
@@ -878,8 +887,8 @@ def run_validation(
     num_patches,
     log_step,
     distributed_state,
-    val_time_limit,
-) -> None:
+    run_dir,
+) -> Dict[str, float]:
     """
     Compute validation set metrics for logging.
 
@@ -895,62 +904,116 @@ def run_validation(
         num_patches (int): Number of vision patches.
         log_step (int): Current logging step.
         distributed_state (PartialState): Distributed training state.
-        val_time_limit (int): Time limit for computing validation metrics.
-
     Returns:
-        None.
+        Averaged validation metrics.
     """
     val_start_time = time.time()
-    vla.eval()
     val_batches_count = 0
+    val_samples_count = 0
+    metric_weighted_sums = {}
 
-    # List to store validation metrics
-    all_val_metrics = []
+    # Validation must also disable dropout or other train-only behavior in
+    # separately wrapped heads/bridges, not only in the VLA backbone. Restore
+    # each module's original mode even if validation raises.
+    eval_modules = [
+        module
+        for module in (vla, action_head, proprio_projector, noisy_action_projector, pair_bridge, action_ae_encoder)
+        if module is not None
+    ]
+    module_training_states = [(module, module.training) for module in eval_modules]
+    for module, _ in module_training_states:
+        module.eval()
 
-    with torch.no_grad():
-        for batch in val_dataloader:
-            # Always compute L1 loss for validation, even for diffusion
-            _, metrics = run_forward_pass(
-                vla=vla,
-                action_head=action_head,
-                proprio_projector=proprio_projector,
-                batch=batch,
-                action_tokenizer=action_tokenizer,
-                device_id=device_id,
-                use_l1_regression=cfg.use_l1_regression,
-                use_proprio=cfg.use_proprio,
-                use_film=cfg.use_film,
-                num_patches=num_patches,
-                compute_diffusion_l1=True,
-                use_pro_version=cfg.use_pro_version,
-                cfg=cfg,
-                pair_bridge=pair_bridge,
-                action_ae_encoder=action_ae_encoder,
-                pair_global_step=log_step,
-            )
+    try:
+        with torch.no_grad():
+            for batch in val_dataloader:
+                # Always compute L1 loss for validation, even for diffusion.
+                _, metrics = run_forward_pass(
+                    vla=vla,
+                    action_head=action_head,
+                    proprio_projector=proprio_projector,
+                    batch=batch,
+                    action_tokenizer=action_tokenizer,
+                    device_id=device_id,
+                    use_l1_regression=cfg.use_l1_regression,
+                    use_proprio=cfg.use_proprio,
+                    use_film=cfg.use_film,
+                    num_patches=num_patches,
+                    compute_diffusion_l1=True,
+                    use_pro_version=cfg.use_pro_version,
+                    cfg=cfg,
+                    pair_bridge=pair_bridge,
+                    action_ae_encoder=action_ae_encoder,
+                    pair_global_step=log_step,
+                )
 
-            # Add the loss value to the metrics
-            metrics["loss"] = metrics["loss_value"]
-            all_val_metrics.append(metrics)
-            val_batches_count += 1
+                metrics["loss"] = metrics["loss_value"]
+                batch_size = int(batch["input_ids"].shape[0])
+                for metric_name, metric_value in metrics.items():
+                    metric_weighted_sums[metric_name] = (
+                        metric_weighted_sums.get(metric_name, 0.0)
+                        + float(metric_value) * batch_size
+                    )
+                val_samples_count += batch_size
+                val_batches_count += 1
+                if val_batches_count >= cfg.val_num_batches:
+                    break
+    finally:
+        for module, was_training in module_training_states:
+            module.train(was_training)
 
-            # Cut testing on validation set short if it exceeds time limit
-            if time.time() - val_start_time > val_time_limit:
-                break
+    if val_samples_count == 0:
+        raise RuntimeError("Validation produced no batches; cannot select a best checkpoint.")
 
-    # Compute average validation metrics
-    avg_val_metrics = {}
-    for metric_name in all_val_metrics[0].keys():
-        values = [metrics[metric_name] for metrics in all_val_metrics if metric_name in metrics]
-        if values:
-            avg_val_metrics[metric_name] = sum(values) / len(values)
-
-    # Add batch count to metrics
-    avg_val_metrics["val_batches_count"] = val_batches_count
+    # Reduce weighted numerators and sample counts so every rank makes exactly
+    # the same best-checkpoint decision. Weighting by samples also handles a
+    # partially filled final validation batch correctly.
+    metric_names = sorted(metric_weighted_sums)
+    metric_numerators = torch.tensor(
+        [metric_weighted_sums[name] for name in metric_names],
+        device=torch.device("cuda", device_id),
+        dtype=torch.float64,
+    )
+    samples_tensor = torch.tensor(
+        float(val_samples_count),
+        device=torch.device("cuda", device_id),
+        dtype=torch.float64,
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(metric_numerators, op=dist.ReduceOp.SUM)
+        dist.all_reduce(samples_tensor, op=dist.ReduceOp.SUM)
+    avg_val_metrics = {
+        name: (metric_numerators[index] / samples_tensor).item()
+        for index, name in enumerate(metric_names)
+    }
+    # These describe the deterministic window seen by each rank. Validation
+    # ranks intentionally use the same examples to keep DDP forward calls and
+    # checkpoint branches synchronized.
+    avg_val_metrics["val_batches_count"] = float(val_batches_count)
+    avg_val_metrics["val_samples_count"] = float(val_samples_count)
 
     # Log validation metrics to W&B
     if distributed_state.is_main_process:
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
+        record = {
+            "step": int(log_step),
+            "elapsed_seconds": float(time.time() - val_start_time),
+            "deterministic": True,
+            "requested_batches": int(cfg.val_num_batches),
+            "seed": int(cfg.val_seed),
+            "metrics": {name: float(value) for name, value in avg_val_metrics.items()},
+        }
+        metrics_path = Path(run_dir) / cfg.val_metrics_filename
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        print(
+            f"Validation step {log_step}: "
+            f"{cfg.best_val_metric}={avg_val_metrics.get(cfg.best_val_metric, float('nan')):.6f}; "
+            f"history={metrics_path}"
+        )
+
+    return avg_val_metrics
 
 
 
@@ -986,6 +1049,24 @@ def finetune(cfg: FinetuneConfig) -> None:
         cfg.pair_injection_positions = ",".join(
             normalize_pair_injection_positions(cfg.pair_injection_positions)
         )
+    cfg.best_val_metric = str(cfg.best_val_metric).strip()
+    if cfg.save_best_val_checkpoint and not cfg.use_val_set:
+        raise ValueError("save_best_val_checkpoint=True requires use_val_set=True.")
+    if cfg.use_val_set and not 1 <= cfg.val_split_percent <= 99:
+        raise ValueError("val_split_percent must be between 1 and 99 when validation is enabled.")
+    if cfg.use_val_set and cfg.val_num_batches <= 0:
+        raise ValueError("val_num_batches must be positive when validation is enabled.")
+    if cfg.use_val_set and cfg.val_freq <= 0:
+        raise ValueError("val_freq must be positive when validation is enabled.")
+    if cfg.use_val_set and cfg.val_shuffle_buffer_size < cfg.val_num_batches * cfg.batch_size:
+        raise ValueError(
+            "val_shuffle_buffer_size must be at least val_num_batches * batch_size "
+            "so the fixed validation window is sampled from a sufficiently large pool."
+        )
+    if not cfg.best_val_metric:
+        raise ValueError("best_val_metric must not be empty.")
+    if not cfg.val_metrics_filename or Path(cfg.val_metrics_filename).name != cfg.val_metrics_filename:
+        raise ValueError("val_metrics_filename must be a non-empty filename, not a path.")
 
     # GPU setup
     distributed_state = PartialState()
@@ -1293,16 +1374,23 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        validation_split_percent=cfg.val_split_percent if cfg.use_val_set else 0,
     )
     if cfg.use_val_set:
+        # Cache exactly the deterministic validation window needed by one
+        # rank. All DDP ranks intentionally evaluate the same fixed examples.
+        val_num_samples = cfg.val_num_batches * cfg.batch_size
         val_dataset = RLDSDataset(
             cfg.data_root_dir,
             cfg.dataset_name,
             batch_transform,
             resize_resolution=tuple(vla.module.config.image_sizes),
-            shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
-            image_aug=cfg.image_aug,
+            shuffle_buffer_size=val_num_samples,
+            image_aug=False,
             train=False,
+            validation_split_percent=cfg.val_split_percent,
+            seed=cfg.val_seed,
+            validation_shuffle_buffer_size=cfg.val_shuffle_buffer_size,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1377,6 +1465,25 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
 
     # Start training
+    best_val_metric_value = float("inf")
+    best_val_step = None
+    best_checkpoint_dir = Path(str(run_dir) + "--best_val_chkpt")
+    best_metadata_path = best_checkpoint_dir / "best_validation.json"
+    if cfg.save_best_val_checkpoint and best_metadata_path.exists():
+        with best_metadata_path.open("r", encoding="utf-8") as handle:
+            previous_best = json.load(handle)
+        if previous_best.get("metric") == cfg.best_val_metric:
+            previous_value = float(previous_best["value"])
+            if math.isfinite(previous_value):
+                best_val_metric_value = previous_value
+                best_val_step = int(previous_best["step"])
+                if distributed_state.is_main_process:
+                    print(
+                        f"Continuing best validation state: step={best_val_step} "
+                        f"{cfg.best_val_metric}={best_val_metric_value:.6f}"
+                    )
+    last_checkpoint_step = None
+    last_validation_step = None
     with tqdm.tqdm(
         total=cfg.max_steps,
         leave=False,
@@ -1453,7 +1560,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 progress.update()
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and (log_step % cfg.save_freq == 0 or log_step == cfg.max_steps):
+            if (
+                gradient_step_idx > 0
+                and log_step != last_checkpoint_step
+                and (log_step % cfg.save_freq == 0 or log_step == cfg.max_steps)
+            ):
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -1468,10 +1579,16 @@ def finetune(cfg: FinetuneConfig) -> None:
                     distributed_state=distributed_state,
                     new_state_dict=RAW_STATE_DICT,
                 )
+                last_checkpoint_step = log_step
 
             # Test model on validation set
-            if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:
-                run_validation(
+            if (
+                cfg.use_val_set
+                and log_step > 0
+                and log_step != last_validation_step
+                and (log_step % cfg.val_freq == 0 or log_step == cfg.max_steps)
+            ):
+                avg_val_metrics = run_validation(
                     vla=vla,
                     action_head=action_head,
                     noisy_action_projector=None,
@@ -1485,8 +1602,75 @@ def finetune(cfg: FinetuneConfig) -> None:
                     num_patches=NUM_PATCHES,
                     log_step=log_step,
                     distributed_state=distributed_state,
-                    val_time_limit=cfg.val_time_limit,
+                    run_dir=run_dir,
                 )
+                last_validation_step = log_step
+
+                if cfg.save_best_val_checkpoint:
+                    if cfg.best_val_metric not in avg_val_metrics:
+                        available = ", ".join(sorted(avg_val_metrics))
+                        raise ValueError(
+                            f"Validation metric {cfg.best_val_metric!r} is unavailable; "
+                            f"choose one of: {available}"
+                        )
+                    candidate_value = float(avg_val_metrics[cfg.best_val_metric])
+                    if not math.isfinite(candidate_value):
+                        raise ValueError(
+                            f"Validation metric {cfg.best_val_metric!r} is not finite at step {log_step}: "
+                            f"{candidate_value}"
+                        )
+                    if candidate_value < best_val_metric_value:
+                        previous_value = best_val_metric_value
+                        best_val_metric_value = candidate_value
+                        best_val_step = log_step
+                        save_training_checkpoint(
+                            cfg=cfg,
+                            run_dir=run_dir,
+                            log_step=log_step,
+                            vla=vla,
+                            processor=processor,
+                            proprio_projector=proprio_projector if cfg.use_proprio else None,
+                            noisy_action_projector=None,
+                            action_head=action_head,
+                            pair_bridge=pair_bridge if cfg.use_pair_bridge else None,
+                            train_dataset=train_dataset,
+                            distributed_state=distributed_state,
+                            new_state_dict=RAW_STATE_DICT,
+                            checkpoint_dir_override=best_checkpoint_dir,
+                            checkpoint_name_suffix_override="best_val_checkpoint.pt",
+                        )
+                        if distributed_state.is_main_process:
+                            best_metadata = {
+                                "version": 2,
+                                "run_id": run_id,
+                                "step": int(best_val_step),
+                                "metric": cfg.best_val_metric,
+                                "value": float(best_val_metric_value),
+                                "previous_value": (
+                                    None if not math.isfinite(previous_value) else float(previous_value)
+                                ),
+                                "validation_metrics": {
+                                    name: float(value) for name, value in avg_val_metrics.items()
+                                },
+                                "validation_config": {
+                                    "split_percent": int(cfg.val_split_percent),
+                                    "num_batches": int(cfg.val_num_batches),
+                                    "seed": int(cfg.val_seed),
+                                    "shuffle_buffer_size": int(cfg.val_shuffle_buffer_size),
+                                    "image_aug": False,
+                                    "shuffle": "fixed_seed_once",
+                                },
+                            }
+                            metadata_path = best_metadata_path
+                            temp_metadata_path = metadata_path.with_suffix(".json.tmp")
+                            with temp_metadata_path.open("w", encoding="utf-8") as handle:
+                                json.dump(best_metadata, handle, indent=2, sort_keys=True)
+                            os.replace(temp_metadata_path, metadata_path)
+                            print(
+                                f"New best validation checkpoint: step={best_val_step} "
+                                f"{cfg.best_val_metric}={best_val_metric_value:.6f} "
+                                f"path={best_checkpoint_dir}"
+                            )
                 # Set model back to training mode after validation
                 vla.train()
 

@@ -53,6 +53,7 @@ def make_dataset_from_rlds(
     action_normalization_mask: Optional[List[bool]] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
+    validation_split_percent: int = 0,
 ) -> Tuple[dl.DLataset, dict]:
     """
     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
@@ -201,21 +202,51 @@ def make_dataset_from_rlds(
 
     builder = tfds.builder(name, data_dir=data_dir)
 
+    # Resolve the trajectory-level data split before computing normalization
+    # statistics.  The same training-only statistics are then used for both
+    # train and validation, so the held-out trajectories cannot influence
+    # action/proprio normalization.
+    available_splits = set(builder.info.splits.keys())
+    has_native_validation = bool({"val", "validation"} & available_splits)
+    if train:
+        if validation_split_percent and not has_native_validation:
+            split = f"train[:{100 - validation_split_percent}%]"
+        else:
+            split = "train"
+    elif "val" in available_splits:
+        split = "val"
+    elif "validation" in available_splits:
+        split = "validation"
+    elif validation_split_percent:
+        split = f"train[{100 - validation_split_percent}%:]"
+    else:
+        raise ValueError(
+            f"Dataset {name!r} has no val/validation split. Set validation_split_percent "
+            "to create a deterministic holdout from train."
+        )
+
+    statistics_split = (
+        f"train[:{100 - validation_split_percent}%]"
+        if validation_split_percent and not has_native_validation
+        else "train"
+    )
+
     # load or compute dataset statistics
     if isinstance(dataset_statistics, str):
         with tf.io.gfile.GFile(dataset_statistics, "r") as f:
             dataset_statistics = json.load(f)
     elif dataset_statistics is None:
-        full_dataset = dl.DLataset.from_rlds(
-            builder, split="all", shuffle=False, num_parallel_reads=num_parallel_reads
+        statistics_dataset = dl.DLataset.from_rlds(
+            builder, split=statistics_split, shuffle=False, num_parallel_reads=num_parallel_reads
         ).traj_map(restructure, num_parallel_calls)
         # tries to load from cache, otherwise computes on the fly
         dataset_statistics = get_dataset_statistics(
-            full_dataset,
+            statistics_dataset,
             hash_dependencies=(
                 str(builder.info),
                 str(state_obs_keys),
                 inspect.getsource(standardize_fn) if standardize_fn is not None else "",
+                f"statistics_split={statistics_split}",
             ),
             save_dir=builder.data_dir,
         )
@@ -229,9 +260,6 @@ def make_dataset_from_rlds(
                 f"does not match action dimension ({dataset_statistics['action']['mean'].shape[-1]})."
             )
         dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
-
-    # construct the dataset
-    split = "train" if train else "val"
 
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
 
@@ -463,6 +491,8 @@ def make_interleaved_dataset(
     balance_weights: bool = False,
     traj_transform_threads: Optional[int] = None,
     traj_read_threads: Optional[int] = None,
+    seed: int = 0,
+    validation_shuffle_buffer_size: Optional[int] = None,
 ) -> dl.DLataset:
     """
     Creates an interleaved dataset from list of dataset configs (kwargs). Returns a dataset of batched frames.
@@ -486,6 +516,8 @@ def make_interleaved_dataset(
             datasets according to their sampling weights. If None, defaults to AUTOTUNE for every dataset.
         traj_read_threads: total number of parallel read workers for trajectory transforms, distributed across
             datasets according to their sampling weights. If None, defaults to AUTOTUNE for every dataset.
+        seed: fixed seed used only for deterministic validation sampling.
+        validation_shuffle_buffer_size: size of the one-time fixed-seed validation sampling pool.
     """
     # Default to uniform sampling (if `sample_weights` is not specified)
     if not sample_weights:
@@ -504,7 +536,7 @@ def make_interleaved_dataset(
         data_kwargs = copy.deepcopy(dataset_kwargs)
         if "dataset_frame_transform_kwargs" in data_kwargs:
             data_kwargs.pop("dataset_frame_transform_kwargs")
-        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train)
+        _, dataset_statistics = make_dataset_from_rlds(**data_kwargs, train=train, shuffle=train)
         dataset_sizes.append(dataset_statistics["num_transitions"])
         all_dataset_statistics[dataset_kwargs["name"]] = dataset_statistics
 
@@ -544,12 +576,15 @@ def make_interleaved_dataset(
         dataset, _ = make_dataset_from_rlds(
             **dataset_kwargs,
             train=train,
+            shuffle=train,
             num_parallel_calls=threads,
             num_parallel_reads=reads,
             dataset_statistics=all_dataset_statistics[dataset_kwargs["name"]],
         )
+        if train:
+            dataset = dataset.repeat()
         dataset = apply_trajectory_transforms(
-            dataset.repeat(),
+            dataset,
             **traj_transform_kwargs,
             num_parallel_calls=threads,
             train=train,
@@ -558,15 +593,28 @@ def make_interleaved_dataset(
         datasets.append(dataset)
 
     # Interleave at the Frame Level
-    dataset: dl.DLataset = dl.DLataset.sample_from_datasets(datasets, sample_weights)
+    if train:
+        dataset: dl.DLataset = dl.DLataset.sample_from_datasets(datasets, sample_weights)
+    else:
+        dataset = dl.DLataset.sample_from_datasets(
+            datasets,
+            sample_weights,
+            seed=seed,
+            rerandomize_each_iteration=False,
+        )
 
-    # Validation =>> fix a single shuffle buffer of data and cache it in RAM; prevents gradual memory increase!
-    if not train:
-        dataset = dataset.take(shuffle_buffer_size).cache()
-
-    # Shuffle the Dataset
-    #   =>> IMPORTANT :: Shuffle AFTER .cache(), or else memory will still leak!
-    dataset = dataset.shuffle(shuffle_buffer_size)
+    if train:
+        dataset = dataset.shuffle(shuffle_buffer_size)
+    else:
+        # Select a representative window once with a fixed seed, then cache it.
+        # There is no per-validation reshuffle: every checkpoint sees exactly
+        # the same examples in the same order.
+        validation_pool_size = validation_shuffle_buffer_size or shuffle_buffer_size
+        dataset = dataset.shuffle(
+            validation_pool_size,
+            seed=seed,
+            reshuffle_each_iteration=False,
+        ).take(shuffle_buffer_size).cache()
 
     # Apply Frame Transforms
     overwatch.info("Applying frame transforms on dataset...")
