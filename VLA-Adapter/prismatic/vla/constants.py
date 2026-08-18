@@ -4,6 +4,7 @@ Important constants for VLA training and evaluation.
 Attempts to automatically identify the correct constants to set based on the Python command used to launch
 training or evaluation. If it is unclear, defaults to using the LIBERO simulation benchmark constants.
 """
+import os
 import sys
 from enum import Enum
 
@@ -53,12 +54,28 @@ BRIDGE_CONSTANTS = {
     "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
 }
 
+UF850_CONSTANTS = {
+    "NUM_ACTIONS_CHUNK": 8,
+    "ACTION_DIM": 7,
+    "PROPRIO_DIM": 6,
+    "ACTION_PROPRIO_NORMALIZATION_TYPE": NormalizationType.BOUNDS_Q99,
+}
+
 
 # Function to detect robot platform from command line arguments
 def detect_robot_platform():
+    explicit_platform = os.environ.get("VLA_ROBOT_PLATFORM")
+    if explicit_platform:
+        platform = explicit_platform.upper()
+        if platform not in {"LIBERO", "CALVIN", "ALOHA", "BRIDGE", "UF850"}:
+            raise ValueError(f"Unsupported VLA_ROBOT_PLATFORM={explicit_platform!r}")
+        return platform
+
     cmd_args = " ".join(sys.argv).lower()
 
-    if "libero" in cmd_args:
+    if "uf850" in cmd_args or "xarm" in cmd_args:
+        return "UF850"
+    elif "libero" in cmd_args:
         return "LIBERO"
     elif "aloha" in cmd_args:
         return "ALOHA"
@@ -83,6 +100,8 @@ elif ROBOT_PLATFORM == "BRIDGE":
     constants = BRIDGE_CONSTANTS
 elif ROBOT_PLATFORM == "CALVIN":
     constants = CALVIN_CONSTANTS
+elif ROBOT_PLATFORM == "UF850":
+    constants = UF850_CONSTANTS
 
 # Assign constants to global variables
 NUM_ACTIONS_CHUNK = constants["NUM_ACTIONS_CHUNK"]

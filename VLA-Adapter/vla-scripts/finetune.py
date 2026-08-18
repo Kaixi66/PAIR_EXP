@@ -123,6 +123,8 @@ class FinetuneConfig:
     val_shuffle_buffer_size: int = 10_000            # One-time fixed-seed sampling pool for validation
     val_time_limit: int = 180                        # Deprecated compatibility option; fixed batches are used instead
     val_split_percent: int = 5                       # Hold out this share of train if no native val split exists
+    episode_split_file: Optional[str] = None          # Optional explicit train/validation episode path manifest
+    data_contract_file: Optional[str] = None          # Optional serialized robot/data tensor contract
     save_best_val_checkpoint: bool = False           # Overwrite one best-val checkpoint when validation improves
     best_val_metric: str = "action_l1_loss"         # Validation metric minimized for best-checkpoint selection
     val_metrics_filename: str = "validation_metrics.jsonl"  # Local validation history under the run directory
@@ -793,6 +795,12 @@ def save_training_checkpoint(
         os.makedirs(adapter_dir, exist_ok=True)
         save_dataset_statistics(train_dataset.dataset_statistics, checkpoint_dir)
         save_eval_model_config(cfg, checkpoint_dir)
+        if cfg.data_contract_file:
+            with open(cfg.data_contract_file, "r", encoding="utf-8") as f:
+                data_contract = json.load(f)
+            with open(checkpoint_dir / "data_contract.json", "w", encoding="utf-8") as f:
+                json.dump(data_contract, f, indent=2, sort_keys=True)
+                f.write("\n")
         print(f"Saving Model Checkpoint for Step {log_step}")
 
     # Wait for directories to be created
@@ -1375,6 +1383,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         validation_split_percent=cfg.val_split_percent if cfg.use_val_set else 0,
+        episode_split_file=cfg.episode_split_file,
     )
     if cfg.use_val_set:
         # Cache exactly the deterministic validation window needed by one
@@ -1391,11 +1400,18 @@ def finetune(cfg: FinetuneConfig) -> None:
             validation_split_percent=cfg.val_split_percent,
             seed=cfg.val_seed,
             validation_shuffle_buffer_size=cfg.val_shuffle_buffer_size,
+            episode_split_file=cfg.episode_split_file,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
     if distributed_state.is_main_process:
         save_dataset_statistics(train_dataset.dataset_statistics, run_dir)
+        if cfg.data_contract_file:
+            with open(cfg.data_contract_file, "r", encoding="utf-8") as f:
+                data_contract = json.load(f)
+            with open(Path(run_dir) / "data_contract.json", "w", encoding="utf-8") as f:
+                json.dump(data_contract, f, indent=2, sort_keys=True)
+                f.write("\n")
 
     # Create collator and dataloader
     collator = PaddedCollatorForActionPrediction(

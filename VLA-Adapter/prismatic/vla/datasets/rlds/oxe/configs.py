@@ -37,6 +37,7 @@ class StateEncoding(IntEnum):
     POS_QUAT = 2            # EEF XYZ (3) + Quaternion (4) + Gripper Open/Close (1)
     JOINT = 3               # Joint Angles (7, <PAD> if fewer) + Gripper Open/Close (1)
     JOINT_BIMANUAL = 4      # Joint Angles (2 x [ Joint Angles (6) + Gripper Open/Close (1) ])
+    UF850_JOINT_RAD = 5     # UF850 joint angles (6), radians, no padding or gripper state
     # fmt: on
 
 
@@ -347,6 +348,18 @@ OXE_DATASET_CONFIGS = {
         "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
         "state_obs_keys": ["end_effector_pose", None, None],
         "state_encoding": StateEncoding.POS_EULER,
+        "action_encoding": ActionEncoding.EEF_POS,
+    },
+    "uf850_vr_teleop_rlds": {
+        "tfds_name": "utokyo_xarm_pick_and_place_converted_externally_to_rlds",
+        "image_obs_keys": {
+            "primary": "image",
+            "secondary": None,
+            "wrist": "hand_image",
+        },
+        "depth_obs_keys": {"primary": None, "secondary": None, "wrist": None},
+        "state_obs_keys": ["joint_angles"],
+        "state_encoding": StateEncoding.UF850_JOINT_RAD,
         "action_encoding": ActionEncoding.EEF_POS,
     },
     "utokyo_xarm_bimanual_converted_externally_to_rlds": {

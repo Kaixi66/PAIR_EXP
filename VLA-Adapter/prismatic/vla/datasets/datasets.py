@@ -157,6 +157,7 @@ class RLDSDataset(IterableDataset):
         validation_split_percent: int = 0,
         seed: int = 0,
         validation_shuffle_buffer_size: Optional[int] = None,
+        episode_split_file: Optional[str] = None,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -185,6 +186,7 @@ class RLDSDataset(IterableDataset):
         )
         for dataset_kwargs in per_dataset_kwargs:
             dataset_kwargs["validation_split_percent"] = validation_split_percent
+            dataset_kwargs["episode_split_file"] = episode_split_file
         rlds_config = dict(
             traj_transform_kwargs=dict(
                 window_size=1,                                      # If we wanted to feed / predict more than one step

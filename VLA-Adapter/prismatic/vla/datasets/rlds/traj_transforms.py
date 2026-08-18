@@ -24,7 +24,9 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     """
     traj_len = tf.shape(traj["action"])[0]
     action_dim = traj["action"].shape[-1]
-    effective_traj_len = traj_len - future_action_window_size
+    # Keep every real timestep. Future indices beyond the trajectory are
+    # converted to neutral actions below instead of dropping the final frames.
+    effective_traj_len = traj_len
     chunk_indices = tf.broadcast_to(tf.range(-window_size + 1, 1), [effective_traj_len, window_size]) + tf.broadcast_to(
         tf.range(effective_traj_len)[:, None], [effective_traj_len, window_size]
     )
@@ -44,7 +46,15 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     floored_action_chunk_indices = tf.minimum(tf.maximum(action_chunk_indices, 0), goal_timestep[:, None])
 
     traj["observation"] = tf.nest.map_structure(lambda x: tf.gather(x, floored_chunk_indices), traj["observation"])
-    traj["action"] = tf.gather(traj["action"], floored_action_chunk_indices)
+    gathered_actions = tf.gather(traj["action"], floored_action_chunk_indices)
+    action_indices_valid = tf.logical_and(action_chunk_indices >= 0, action_chunk_indices <= goal_timestep[:, None])
+    current_absolute_action_mask = tf.gather(traj["absolute_action_mask"], tf.range(effective_traj_len))
+    neutral_actions = tf.where(
+        current_absolute_action_mask[:, None, :],
+        gathered_actions,
+        tf.zeros_like(gathered_actions),
+    )
+    traj["action"] = tf.where(action_indices_valid[:, :, None], gathered_actions, neutral_actions)
 
     # indicates whether an entire observation is padding
     traj["observation"]["pad_mask"] = chunk_indices >= 0
@@ -52,7 +62,7 @@ def chunk_act_obs(traj: Dict, window_size: int, future_action_window_size: int =
     # Truncate other elements of the trajectory dict
     traj["task"] = tf.nest.map_structure(lambda x: tf.gather(x, tf.range(effective_traj_len)), traj["task"])
     traj["dataset_name"] = tf.gather(traj["dataset_name"], tf.range(effective_traj_len))
-    traj["absolute_action_mask"] = tf.gather(traj["absolute_action_mask"], tf.range(effective_traj_len))
+    traj["absolute_action_mask"] = current_absolute_action_mask
 
     return traj
 

@@ -29,6 +29,7 @@ def make_oxe_dataset_kwargs(
 ) -> Dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""
     dataset_kwargs = deepcopy(OXE_DATASET_CONFIGS[dataset_name])
+    tfds_name = dataset_kwargs.pop("tfds_name", dataset_name)
     if dataset_kwargs["action_encoding"] not in [ActionEncoding.EEF_POS, ActionEncoding.EEF_R6, ActionEncoding.JOINT_POS_BIMANUAL]:
         raise ValueError(f"Cannot load `{dataset_name}`; only EEF_POS & EEF_R6 & JOINT_POS_BIMANUAL actions supported!")
 
@@ -76,7 +77,7 @@ def make_oxe_dataset_kwargs(
     if "aux_kwargs" in dataset_kwargs:
         dataset_kwargs.update(dataset_kwargs.pop("aux_kwargs"))
 
-    return {"name": dataset_name, "data_dir": str(data_root_dir), **dataset_kwargs}
+    return {"name": tfds_name, "data_dir": str(data_root_dir), **dataset_kwargs}
 
 
 def get_oxe_dataset_kwargs_and_weights(

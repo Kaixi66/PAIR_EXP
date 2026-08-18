@@ -528,6 +528,12 @@ def utokyo_xarm_pick_place_dataset_transform(trajectory: Dict[str, Any]) -> Dict
     return trajectory
 
 
+def uf850_vr_teleop_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
+    """Expose the UF850 state under its true semantics: six joint angles in radians."""
+    trajectory["observation"]["joint_angles"] = trajectory["observation"]["end_effector_pose"]
+    return trajectory
+
+
 def utokyo_xarm_bimanual_dataset_transform(trajectory: Dict[str, Any]) -> Dict[str, Any]:
     trajectory["action"] = trajectory["action"][..., -7:]
     return trajectory
@@ -910,6 +916,7 @@ OXE_STANDARDIZATION_TRANSFORMS = {
     "utokyo_pr2_opening_fridge_converted_externally_to_rlds": tokyo_pr2_opening_fridge_dataset_transform,
     "utokyo_pr2_tabletop_manipulation_converted_externally_to_rlds": tokyo_pr2_tabletop_manipulation_dataset_transform,
     "utokyo_xarm_pick_and_place_converted_externally_to_rlds": utokyo_xarm_pick_place_dataset_transform,
+    "uf850_vr_teleop_rlds": uf850_vr_teleop_dataset_transform,
     "utokyo_xarm_bimanual_converted_externally_to_rlds": utokyo_xarm_bimanual_dataset_transform,
     "robo_net": robo_net_dataset_transform,
     "berkeley_mvp_converted_externally_to_rlds": berkeley_mvp_dataset_transform,

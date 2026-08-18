@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import math
 import os
 import random
@@ -86,6 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask_prob", type=float, default=None)
     parser.add_argument("--mask_count", type=int, default=None)
     parser.add_argument("--noise_std", type=float, default=None)
+    parser.add_argument("--episode_split_file", type=str, default=None)
+    parser.add_argument("--data_contract_file", type=str, default=None)
     return parser.parse_args()
 
 
@@ -167,6 +170,10 @@ def apply_cli_overrides(config: Dict[str, Any], args: argparse.Namespace) -> Dic
         updates.setdefault("model", {})["mask_count"] = args.mask_count
     if args.noise_std is not None:
         updates.setdefault("model", {})["noise_std"] = args.noise_std
+    if args.episode_split_file is not None:
+        updates.setdefault("data", {})["episode_split_file"] = args.episode_split_file
+    if args.data_contract_file is not None:
+        updates.setdefault("data", {})["data_contract_file"] = args.data_contract_file
     return deep_update(config, updates)
 
 
@@ -424,7 +431,7 @@ def make_v2_dataloader(
         use_proprio=False,
         use_minivlm=bool(vla_cfg.get("use_minivlm", True)),
     )
-    dataset_train = train or bool(data_cfg.get("eval_uses_train_split", True))
+    dataset_train = train or bool(data_cfg.get("eval_uses_train_split", False))
     dataset = RLDSDataset(
         Path(data_cfg.get("data_root_dir", "/data/kaixi/dataset/libero")),
         data_cfg.get("mixture", "libero_4_task_suites_no_noops"),
@@ -433,6 +440,8 @@ def make_v2_dataloader(
         shuffle_buffer_size=int(data_cfg.get("shuffle_buffer_size", 100_000 if train else 10_000)),
         train=dataset_train,
         image_aug=bool(data_cfg.get("image_aug", train)) if train else False,
+        validation_split_percent=int(data_cfg.get("validation_split_percent", 0)),
+        episode_split_file=data_cfg.get("episode_split_file"),
     )
     collator = PaddedCollatorForActionPrediction(
         processor.tokenizer.model_max_length,
@@ -627,8 +636,14 @@ def train_v2(
         processor=processor,
         train=False,
     )
+    data_contract = None
     if distributed_state.is_main_process:
         save_json(run_dir / "dataset_statistics.json", dataset_statistics)
+        data_contract_path = data_cfg.get("data_contract_file")
+        if data_contract_path:
+            with Path(data_contract_path).open("r", encoding="utf-8") as f:
+                data_contract = json.load(f)
+            save_json(run_dir / "data_contract.json", data_contract)
 
     optimizer = AdamW(
         model.parameters(),
@@ -751,7 +766,23 @@ def train_v2(
                         path=best_encoder_path,
                         encoder=module.encoder,
                         config=ae_config,
-                        metadata={"step": step, "eval_l1": best_eval_l1, "run_name": run_name},
+                        metadata={
+                            "step": step,
+                            "eval_l1": best_eval_l1,
+                            "run_name": run_name,
+                            "data_contract": data_contract,
+                        },
+                    )
+                    save_encoder_checkpoint(
+                        path=run_dir / "encoder_best.pt",
+                        encoder=module.encoder,
+                        config=ae_config,
+                        metadata={
+                            "step": step,
+                            "eval_l1": best_eval_l1,
+                            "run_name": run_name,
+                            "data_contract": data_contract,
+                        },
                     )
             distributed_barrier(distributed_state)
 
@@ -929,6 +960,12 @@ def main() -> None:
                     )
                     save_encoder_checkpoint(
                         path=best_encoder_path,
+                        encoder=module.encoder,
+                        config=action_ae_config,
+                        metadata={"step": step, "eval_l1": best_eval_l1, "run_name": run_name},
+                    )
+                    save_encoder_checkpoint(
+                        path=run_dir / "encoder_best.pt",
                         encoder=module.encoder,
                         config=action_ae_config,
                         metadata={"step": step, "eval_l1": best_eval_l1, "run_name": run_name},

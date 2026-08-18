@@ -38,6 +38,23 @@ def test_encoder_checkpoint_roundtrip(tmp_path: Path):
     assert latent.shape == (2, 8, 16)
 
 
+def test_encoder_checkpoint_preserves_uf850_data_contract(tmp_path: Path):
+    config = ActionAEConfig()
+    model = ActionTransformerAE(config)
+    path = tmp_path / "encoder_best.pt"
+    contract = {"robot": "UFACTORY UF850", "proprio": {"shape": [6]}, "action": {"shape": [8, 7]}}
+
+    save_encoder_checkpoint(
+        path=path,
+        encoder=model.encoder,
+        config=config,
+        metadata={"data_contract": contract},
+    )
+    payload = torch.load(path, map_location="cpu")
+
+    assert payload["metadata"]["data_contract"] == contract
+
+
 def test_action_perception_ae_forward_shapes():
     config = ActionPerceptionAEConfig(perception_dim=32)
     model = ActionPerceptionTransformerAE(config)

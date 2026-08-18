@@ -54,6 +54,7 @@ def make_dataset_from_rlds(
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
     validation_split_percent: int = 0,
+    episode_split_file: Optional[str] = None,
 ) -> Tuple[dl.DLataset, dict]:
     """
     This function is responsible for loading a specific RLDS dataset from storage and getting it into a standardized
@@ -202,13 +203,40 @@ def make_dataset_from_rlds(
 
     builder = tfds.builder(name, data_dir=data_dir)
 
+    episode_split = None
+    selected_episode_paths = None
+    train_episode_paths = None
+    if episode_split_file:
+        with tf.io.gfile.GFile(episode_split_file, "r") as f:
+            episode_split = json.load(f)
+        train_episode_paths = episode_split.get("train_episode_paths")
+        validation_episode_paths = episode_split.get("validation_episode_paths")
+        if not train_episode_paths or not validation_episode_paths:
+            raise ValueError(
+                "episode_split_file must contain non-empty train_episode_paths and validation_episode_paths"
+            )
+        overlap = set(train_episode_paths) & set(validation_episode_paths)
+        if overlap:
+            raise ValueError(f"Episode split contains train/validation overlap: {sorted(overlap)}")
+        selected_episode_paths = train_episode_paths if train else validation_episode_paths
+
+    def filter_episode_paths(dataset, paths):
+        allowed = tf.constant(paths, dtype=tf.string)
+        return dataset.filter(
+            lambda traj: tf.reduce_any(
+                tf.equal(traj["traj_metadata"]["episode_metadata"]["file_path"][0], allowed)
+            )
+        )
+
     # Resolve the trajectory-level data split before computing normalization
     # statistics.  The same training-only statistics are then used for both
     # train and validation, so the held-out trajectories cannot influence
     # action/proprio normalization.
     available_splits = set(builder.info.splits.keys())
     has_native_validation = bool({"val", "validation"} & available_splits)
-    if train:
+    if episode_split_file:
+        split = "train"
+    elif train:
         if validation_split_percent and not has_native_validation:
             split = f"train[:{100 - validation_split_percent}%]"
         else:
@@ -229,7 +257,7 @@ def make_dataset_from_rlds(
         f"train[:{100 - validation_split_percent}%]"
         if validation_split_percent and not has_native_validation
         else "train"
-    )
+    ) if not episode_split_file else "train"
 
     # load or compute dataset statistics
     if isinstance(dataset_statistics, str):
@@ -238,7 +266,10 @@ def make_dataset_from_rlds(
     elif dataset_statistics is None:
         statistics_dataset = dl.DLataset.from_rlds(
             builder, split=statistics_split, shuffle=False, num_parallel_reads=num_parallel_reads
-        ).traj_map(restructure, num_parallel_calls)
+        )
+        if episode_split_file:
+            statistics_dataset = filter_episode_paths(statistics_dataset, train_episode_paths)
+        statistics_dataset = statistics_dataset.traj_map(restructure, num_parallel_calls)
         # tries to load from cache, otherwise computes on the fly
         dataset_statistics = get_dataset_statistics(
             statistics_dataset,
@@ -247,6 +278,7 @@ def make_dataset_from_rlds(
                 str(state_obs_keys),
                 inspect.getsource(standardize_fn) if standardize_fn is not None else "",
                 f"statistics_split={statistics_split}",
+                f"episode_split={episode_split}",
             ),
             save_dir=builder.data_dir,
         )
@@ -262,6 +294,8 @@ def make_dataset_from_rlds(
         dataset_statistics["action"]["mask"] = np.array(action_normalization_mask)
 
     dataset = dl.DLataset.from_rlds(builder, split=split, shuffle=shuffle, num_parallel_reads=num_parallel_reads)
+    if episode_split_file:
+        dataset = filter_episode_paths(dataset, selected_episode_paths)
 
     dataset = dataset.traj_map(restructure, num_parallel_calls)
     dataset = dataset.traj_map(
